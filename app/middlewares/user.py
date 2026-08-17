@@ -1,5 +1,3 @@
-from app.database.repositories.characters import CharacterRepository
-from app.services.progression import ProgressionService
 
 from __future__ import annotations
 
@@ -18,6 +16,8 @@ from app.database.repositories.tasks import TasksRepository
 from app.database.repositories.users import UserRepository
 from app.services.events import EventsService
 from app.services.rewards import RewardsService
+from app.database.repositories.characters import CharacterRepository
+from app.services.progression import ProgressionService
 
 
 class UserMiddleware(BaseMiddleware):
@@ -163,12 +163,6 @@ class UserMiddleware(BaseMiddleware):
 
             character_before = await character_repository.get_character(
                 telegram_user.id
-            )
-
-            result = await rewards_service.message_reward(
-                user_id=telegram_user.id,
-                chat_id=chat_id,
-                message_type=message_type,
             )
 
             result = await rewards_service.message_reward(
