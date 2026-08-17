@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from sqlalchemy import event, inspect, text
+from sqlalchemy import (
+    BigInteger,
+    Integer,
+    event,
+    inspect,
+    text,
+)
 
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -12,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
 from app.config.settings import settings
 from app.database.models import Base
 
+from app.database.seeds import seed_defaults
 
 DATABASE_URL = settings.DATABASE_URL
 
@@ -186,12 +193,46 @@ async def _ensure_sqlite_schema(
         inspect_schema
     )
 
+def _prepare_sqlite_autoincrement() -> None:
+    """
+    SQLite требует физический тип INTEGER для настоящего
+    autoincrement primary key.
+
+    В проекте часть моделей исторически использует
+    BigInteger для ID. Для PostgreSQL это нормально,
+    но SQLite создаёт в таком случае BIGINT PRIMARY KEY,
+    который не получает автоматический ROWID.
+
+    Поэтому перед create_all() переводим только те PK,
+    которые реально являются autoincrement.
+
+    Важно:
+        - Telegram ID пользователей НЕ затрагивается;
+        - chat_id НЕ затрагивается;
+        - foreign key поля НЕ затрагиваются;
+        - PostgreSQL / другие БД не затрагиваются.
+    """
+
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+
+    for table in Base.metadata.tables.values():
+        for column in table.primary_key.columns:
+            if not column.autoincrement:
+                continue
+
+            if isinstance(column.type, BigInteger):
+                column.type = Integer()
 
 async def init_database() -> None:
     """
-    Создаёт отсутствующие таблицы и выполняет
-    небольшие совместимые schema upgrades.
+    Создаёт отсутствующие таблицы,
+    выполняет schema upgrades и добавляет
+    первоначальные игровые данные.
     """
+
+    if DATABASE_URL.startswith("sqlite"):
+        _prepare_sqlite_autoincrement()
 
     async with engine.begin() as connection:
         await connection.run_sync(
@@ -201,6 +242,14 @@ async def init_database() -> None:
         await _ensure_sqlite_schema(
             connection
         )
+
+    async with AsyncSessionLocal() as session:
+        try:
+            await seed_defaults(session)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def close_database() -> None:
