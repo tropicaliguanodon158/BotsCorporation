@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,17 +26,16 @@ class RewardsService:
     """
     Единый сервис наград.
 
-    Отвечает за:
+    Все изменения выполняются внутри внешней DB-транзакции.
+
+    Для конкурентных операций пользователь блокируется через
+    SELECT ... FOR UPDATE.
+
+    Это особенно важно для:
         - награды за сообщения;
-        - фото;
-        - видео;
         - hourly;
         - daily;
-        - произвольные награды.
-
-    ВАЖНО:
-        Сервис не выполняет commit().
-        Транзакцией управляет внешний слой приложения.
+        - анти-спам cooldown.
     """
 
     DEFAULT_MESSAGE_REWARD = Decimal("1.00")
@@ -108,13 +106,6 @@ class RewardsService:
         return datetime.now()
 
     @staticmethod
-    def _normalize_datetime(value: datetime) -> datetime:
-        if value.tzinfo is not None:
-            return value.replace(tzinfo=None)
-
-        return value
-
-    @staticmethod
     def _decimal(
         value: Any,
         default: Decimal = Decimal("0.00"),
@@ -130,7 +121,9 @@ class RewardsService:
         if not result.is_finite():
             return default
 
-        return result.quantize(Decimal("0.01"))
+        return result.quantize(
+            Decimal("0.01")
+        )
 
     @staticmethod
     def _int(
@@ -168,81 +161,27 @@ class RewardsService:
         source: str,
         since: datetime,
     ) -> bool:
-        """
-        Проверяет финансовую историю пользователя.
-
-        Это защита от повторной выдачи после уже сохранённой
-        транзакции. Внешняя транзакция БД всё равно должна
-        использоваться для полной защиты от race condition.
-        """
-
         transactions = await self.economy.get_transactions(
             user_id=user_id,
             limit=100,
             offset=0,
         )
 
-        since = self._normalize_datetime(since)
-
         for transaction in transactions:
             if transaction.source != source:
                 continue
 
-            created_at = self._normalize_datetime(
-                transaction.created_at,
-            )
+            created_at = transaction.created_at
+
+            if created_at.tzinfo is not None:
+                created_at = created_at.replace(
+                    tzinfo=None
+                )
 
             if created_at >= since:
                 return True
 
         return False
-
-    async def _already_claimed_today(
-        self,
-        *,
-        user_id: int,
-        source: str,
-    ) -> bool:
-        now = self._now()
-
-        start_of_day = datetime(
-            now.year,
-            now.month,
-            now.day,
-        )
-
-        return await self._has_recent_transaction(
-            user_id=user_id,
-            source=source,
-            since=start_of_day,
-        )
-
-    async def _already_claimed_hourly(
-        self,
-        *,
-        user_id: int,
-    ) -> bool:
-        return await self._has_recent_transaction(
-            user_id=user_id,
-            source="hourly_reward",
-            since=self._now() - timedelta(hours=1),
-        )
-
-    async def _message_on_cooldown(
-        self,
-        *,
-        user_id: int,
-        cooldown_seconds: int,
-    ) -> bool:
-        if cooldown_seconds <= 0:
-            return False
-
-        return await self._has_recent_transaction(
-            user_id=user_id,
-            source="message",
-            since=self._now()
-            - timedelta(seconds=cooldown_seconds),
-        )
 
     # ========================================================================
     # MESSAGE
@@ -259,21 +198,6 @@ class RewardsService:
 
         message_type = message_type.strip().lower()
 
-        if message_type == "photo":
-            return await self.photo_reward(
-                user_id=user_id,
-                chat_id=chat_id,
-            )
-
-        if message_type == "video":
-            return await self.video_reward(
-                user_id=user_id,
-                chat_id=chat_id,
-            )
-
-        if message_type not in {"text", "other"}:
-            message_type = "text"
-
         cooldown = await self._get_setting(
             chat_id=chat_id,
             key=self.SETTING_MESSAGE_COOLDOWN,
@@ -288,34 +212,120 @@ class RewardsService:
             ),
         )
 
-        if await self._message_on_cooldown(
-            user_id=user_id,
-            cooldown_seconds=cooldown,
-        ):
-            return RewardResult(
-                user_id=user_id,
-                chat_id=chat_id,
-                source="message",
-                rewarded=False,
-                reason="cooldown",
+        # Все типы сообщений используют общий cooldown.
+        # Это предотвращает фарм через чередование
+        # text -> photo -> video.
+        source_map = {
+            "text": (
+                self.SETTING_MESSAGE_REWARD,
+                self.SETTING_MESSAGE_XP,
+                self.SETTING_MESSAGE_GEMS,
+                self.DEFAULT_MESSAGE_REWARD,
+                self.DEFAULT_MESSAGE_XP,
+                self.DEFAULT_MESSAGE_GEMS,
+                "message",
+            ),
+            "other": (
+                self.SETTING_MESSAGE_REWARD,
+                self.SETTING_MESSAGE_XP,
+                self.SETTING_MESSAGE_GEMS,
+                self.DEFAULT_MESSAGE_REWARD,
+                self.DEFAULT_MESSAGE_XP,
+                self.DEFAULT_MESSAGE_GEMS,
+                "message",
+            ),
+            "photo": (
+                self.SETTING_PHOTO_REWARD,
+                self.SETTING_PHOTO_XP,
+                self.SETTING_PHOTO_GEMS,
+                self.DEFAULT_PHOTO_REWARD,
+                self.DEFAULT_PHOTO_XP,
+                self.DEFAULT_PHOTO_GEMS,
+                "photo",
+            ),
+            "video": (
+                self.SETTING_VIDEO_REWARD,
+                self.SETTING_VIDEO_XP,
+                self.SETTING_VIDEO_GEMS,
+                self.DEFAULT_VIDEO_REWARD,
+                self.DEFAULT_VIDEO_XP,
+                self.DEFAULT_VIDEO_GEMS,
+                "video",
+            ),
+        }
+
+        if message_type not in source_map:
+            message_type = "text"
+
+        (
+            currency_key,
+            xp_key,
+            gems_key,
+            currency_default,
+            xp_default,
+            gems_default,
+            source,
+        ) = source_map[message_type]
+
+        # --------------------------------------------------------------------
+        # Критическая секция.
+        #
+        # Блокируем строку пользователя ДО проверки cooldown.
+        # Поэтому два одновременных update одного пользователя
+        # не смогут одновременно пройти проверку.
+        # --------------------------------------------------------------------
+
+        user = await self.users.get_by_id_for_update(
+            user_id
+        )
+
+        if user is None:
+            raise ValueError(
+                f"User {user_id} does not exist."
             )
 
+        if cooldown > 0:
+            since = self._now() - timedelta(
+                seconds=cooldown
+            )
+
+            if await self._has_recent_transaction(
+                user_id=user_id,
+                source="message",
+                since=since,
+            ) or await self._has_recent_transaction(
+                user_id=user_id,
+                source="photo",
+                since=since,
+            ) or await self._has_recent_transaction(
+                user_id=user_id,
+                source="video",
+                since=since,
+            ):
+                return RewardResult(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    source=source,
+                    rewarded=False,
+                    reason="cooldown",
+                )
+
         currency = await self._get_setting(
             chat_id=chat_id,
-            key=self.SETTING_MESSAGE_REWARD,
-            default=self.DEFAULT_MESSAGE_REWARD,
+            key=currency_key,
+            default=currency_default,
         )
 
         xp = await self._get_setting(
             chat_id=chat_id,
-            key=self.SETTING_MESSAGE_XP,
-            default=self.DEFAULT_MESSAGE_XP,
+            key=xp_key,
+            default=xp_default,
         )
 
         gems = await self._get_setting(
             chat_id=chat_id,
-            key=self.SETTING_MESSAGE_GEMS,
-            default=self.DEFAULT_MESSAGE_GEMS,
+            key=gems_key,
+            default=gems_default,
         )
 
         return await self._grant_reward(
@@ -323,113 +333,17 @@ class RewardsService:
             chat_id=chat_id,
             currency=self._decimal(
                 currency,
-                self.DEFAULT_MESSAGE_REWARD,
+                currency_default,
             ),
             xp=self._int(
                 xp,
-                self.DEFAULT_MESSAGE_XP,
+                xp_default,
             ),
             gems=self._int(
                 gems,
-                self.DEFAULT_MESSAGE_GEMS,
+                gems_default,
             ),
-            source="message",
-        )
-
-    # ========================================================================
-    # PHOTO
-    # ========================================================================
-
-    async def photo_reward(
-        self,
-        *,
-        user_id: int,
-        chat_id: int | None,
-    ) -> RewardResult:
-        self._validate_user_id(user_id)
-
-        currency = await self._get_setting(
-            chat_id=chat_id,
-            key=self.SETTING_PHOTO_REWARD,
-            default=self.DEFAULT_PHOTO_REWARD,
-        )
-
-        xp = await self._get_setting(
-            chat_id=chat_id,
-            key=self.SETTING_PHOTO_XP,
-            default=self.DEFAULT_PHOTO_XP,
-        )
-
-        gems = await self._get_setting(
-            chat_id=chat_id,
-            key=self.SETTING_PHOTO_GEMS,
-            default=self.DEFAULT_PHOTO_GEMS,
-        )
-
-        return await self._grant_reward(
-            user_id=user_id,
-            chat_id=chat_id,
-            currency=self._decimal(
-                currency,
-                self.DEFAULT_PHOTO_REWARD,
-            ),
-            xp=self._int(
-                xp,
-                self.DEFAULT_PHOTO_XP,
-            ),
-            gems=self._int(
-                gems,
-                self.DEFAULT_PHOTO_GEMS,
-            ),
-            source="photo",
-        )
-
-    # ========================================================================
-    # VIDEO
-    # ========================================================================
-
-    async def video_reward(
-        self,
-        *,
-        user_id: int,
-        chat_id: int | None,
-    ) -> RewardResult:
-        self._validate_user_id(user_id)
-
-        currency = await self._get_setting(
-            chat_id=chat_id,
-            key=self.SETTING_VIDEO_REWARD,
-            default=self.DEFAULT_VIDEO_REWARD,
-        )
-
-        xp = await self._get_setting(
-            chat_id=chat_id,
-            key=self.SETTING_VIDEO_XP,
-            default=self.DEFAULT_VIDEO_XP,
-        )
-
-        gems = await self._get_setting(
-            chat_id=chat_id,
-            key=self.SETTING_VIDEO_GEMS,
-            default=self.DEFAULT_VIDEO_GEMS,
-        )
-
-        return await self._grant_reward(
-            user_id=user_id,
-            chat_id=chat_id,
-            currency=self._decimal(
-                currency,
-                self.DEFAULT_VIDEO_REWARD,
-            ),
-            xp=self._int(
-                xp,
-                self.DEFAULT_VIDEO_XP,
-            ),
-            gems=self._int(
-                gems,
-                self.DEFAULT_VIDEO_GEMS,
-            ),
-            source="video",
+            source=source,
         )
 
     # ========================================================================
@@ -444,8 +358,21 @@ class RewardsService:
     ) -> RewardResult:
         self._validate_user_id(user_id)
 
-        if await self._already_claimed_hourly(
+        user = await self.users.get_by_id_for_update(
+            user_id
+        )
+
+        if user is None:
+            raise ValueError(
+                f"User {user_id} does not exist."
+            )
+
+        since = self._now() - timedelta(hours=1)
+
+        if await self._has_recent_transaction(
             user_id=user_id,
+            source="hourly_reward",
+            since=since,
         ):
             return RewardResult(
                 user_id=user_id,
@@ -503,9 +430,27 @@ class RewardsService:
     ) -> RewardResult:
         self._validate_user_id(user_id)
 
-        if await self._already_claimed_today(
+        user = await self.users.get_by_id_for_update(
+            user_id
+        )
+
+        if user is None:
+            raise ValueError(
+                f"User {user_id} does not exist."
+            )
+
+        now = self._now()
+
+        start_of_day = datetime(
+            now.year,
+            now.month,
+            now.day,
+        )
+
+        if await self._has_recent_transaction(
             user_id=user_id,
             source="daily_reward",
+            since=start_of_day,
         ):
             return RewardResult(
                 user_id=user_id,
@@ -567,21 +512,33 @@ class RewardsService:
     ) -> RewardResult:
         self._validate_user_id(user_id)
 
-        if not source or not source.strip():
-            raise ValueError("Reward source cannot be empty.")
+        if not source.strip():
+            raise ValueError(
+                "Reward source cannot be empty."
+            )
 
         currency = self._decimal(currency)
         xp = self._int(xp)
         gems = self._int(gems)
 
         if currency < 0:
-            raise ValueError("Currency reward cannot be negative.")
+            raise ValueError(
+                "Currency reward cannot be negative."
+            )
 
         if xp < 0:
-            raise ValueError("XP reward cannot be negative.")
+            raise ValueError(
+                "XP reward cannot be negative."
+            )
 
         if gems < 0:
-            raise ValueError("Gem reward cannot be negative.")
+            raise ValueError(
+                "Gem reward cannot be negative."
+            )
+
+        await self.users.get_by_id_for_update(
+            user_id
+        )
 
         return await self._grant_reward(
             user_id=user_id,
@@ -609,18 +566,28 @@ class RewardsService:
         self._validate_user_id(user_id)
 
         if currency < 0:
-            raise ValueError("Currency reward cannot be negative.")
+            raise ValueError(
+                "Currency reward cannot be negative."
+            )
 
         if xp < 0:
-            raise ValueError("XP reward cannot be negative.")
+            raise ValueError(
+                "XP reward cannot be negative."
+            )
 
         if gems < 0:
-            raise ValueError("Gem reward cannot be negative.")
+            raise ValueError(
+                "Gem reward cannot be negative."
+            )
 
-        if not source or not source.strip():
-            raise ValueError("Reward source cannot be empty.")
+        if not source.strip():
+            raise ValueError(
+                "Reward source cannot be empty."
+            )
 
-        source = source.strip()
+        currency = currency.quantize(
+            Decimal("0.01")
+        )
 
         if currency > 0:
             await self.economy.add_balance(
@@ -661,5 +628,9 @@ class RewardsService:
             xp=xp,
             source=source,
             rewarded=rewarded,
-            reason=None if rewarded else "empty_reward",
+            reason=(
+                None
+                if rewarded
+                else "empty_reward"
+            ),
         )
