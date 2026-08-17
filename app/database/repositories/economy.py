@@ -1,6 +1,6 @@
-
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import Sequence
 
@@ -14,19 +14,32 @@ class EconomyRepository:
     """
     Репозиторий экономики.
 
-    Отвечает за низкоуровневую работу с кошельками
-    и финансовыми транзакциями.
-
     ВАЖНО:
-        - бизнес-правила находятся в services/economy.py;
-        - commit() здесь не выполняется;
-        - операции изменения баланса выполняются внутри
-          внешней транзакции сервиса;
-        - операции списания/перевода используют FOR UPDATE,
-          чтобы защитить баланс от race condition.
+
+    - commit() здесь не выполняется;
+    - commit/rollback выполняет внешний middleware;
+    - все изменения кошельков сериализуются одним asyncio.Lock;
+    - это особенно важно для SQLite;
+    - финансовые операции поддерживают reference_id для
+      защиты от повторного начисления.
+
+    Архитектура рассчитана на один постоянно работающий
+    процесс бота.
+
+    При текущем ограничении:
+        максимум 5 чатов;
+        максимум 50 пользователей в каждом;
+        максимум ~250 пользователей.
+
+    Отдельный Redis / distributed lock здесь НЕ нужен.
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    _mutation_lock = asyncio.Lock()
+
+    def __init__(
+        self,
+        session: AsyncSession,
+    ) -> None:
         self.session = session
 
     # ========================================================================
@@ -55,6 +68,42 @@ class EconomyRepository:
             Decimal("0.01")
         )
 
+    async def _find_reference(
+        self,
+        *,
+        user_id: int,
+        reference_id: str | None,
+    ) -> Transaction | None:
+        """
+        Проверить, была ли уже выполнена операция.
+
+        reference_id должен быть уникальным в рамках
+        конкретного пользователя и бизнес-операции.
+
+        Важный момент:
+
+        transfer использует один reference_id для двух
+        пользователей, поэтому глобальный UNIQUE constraint
+        на reference_id нам НЕ нужен.
+        """
+
+        if not reference_id:
+            return None
+
+        result = await self.session.execute(
+            select(Transaction)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.reference_id == reference_id,
+            )
+            .order_by(
+                Transaction.id.desc()
+            )
+            .limit(1)
+        )
+
+        return result.scalar_one_or_none()
+
     # ========================================================================
     # WALLET
     # ========================================================================
@@ -68,8 +117,12 @@ class EconomyRepository:
         """
         Получить кошелёк пользователя.
 
-        for_update=True блокирует существующую строку
-        до окончания текущей DB-транзакции.
+        На PostgreSQL for_update=True использует
+        row-level locking.
+
+        На SQLite SELECT FOR UPDATE не является
+        полноценной блокировкой, поэтому операции
+        изменения дополнительно защищены _mutation_lock.
         """
 
         query = select(Wallet).where(
@@ -77,9 +130,14 @@ class EconomyRepository:
         )
 
         if for_update:
-            query = query.with_for_update()
+            bind = self.session.get_bind()
 
-        result = await self.session.execute(query)
+            if bind.dialect.name != "sqlite":
+                query = query.with_for_update()
+
+        result = await self.session.execute(
+            query
+        )
 
         return result.scalar_one_or_none()
 
@@ -92,8 +150,8 @@ class EconomyRepository:
         """
         Получить кошелёк или создать новый.
 
-        Если кошелёк существует и for_update=True,
-        строка блокируется.
+        Внутри mutation-операций этот метод вызывается
+        под _mutation_lock.
         """
 
         wallet = await self.get_wallet(
@@ -124,7 +182,9 @@ class EconomyRepository:
         self,
         user_id: int,
     ) -> Decimal:
-        wallet = await self.get_wallet(user_id)
+        wallet = await self.get_wallet(
+            user_id
+        )
 
         if wallet is None:
             return Decimal("0.00")
@@ -136,23 +196,26 @@ class EconomyRepository:
         user_id: int,
         amount: Decimal | int | float | str,
     ) -> Wallet:
-        amount = self.normalize_amount(amount)
+        amount = self.normalize_amount(
+            amount
+        )
 
         if amount < 0:
             raise ValueError(
                 "Balance cannot be negative."
             )
 
-        wallet = await self.get_or_create_wallet(
-            user_id,
-            for_update=True,
-        )
+        async with self._mutation_lock:
+            wallet = await self.get_or_create_wallet(
+                user_id,
+                for_update=True,
+            )
 
-        wallet.balance = amount
+            wallet.balance = amount
 
-        await self.session.flush()
+            await self.session.flush()
 
-        return wallet
+            return wallet
 
     # ========================================================================
     # ADD MONEY
@@ -169,7 +232,9 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
-        amount = self.normalize_amount(amount)
+        amount = self.normalize_amount(
+            amount
+        )
 
         if amount <= 0:
             raise ValueError(
@@ -186,33 +251,55 @@ class EconomyRepository:
                 "source cannot be empty."
             )
 
-        wallet = await self.get_or_create_wallet(
-            user_id,
-            for_update=True,
-        )
+        async with self._mutation_lock:
 
-        balance_before = wallet.balance
-        balance_after = balance_before + amount
+            # ----------------------------------------------------------------
+            # IDEMPOTENCY
+            # ----------------------------------------------------------------
 
-        wallet.balance = balance_after
+            existing = await self._find_reference(
+                user_id=user_id,
+                reference_id=reference_id,
+            )
 
-        transaction = Transaction(
-            user_id=user_id,
-            amount=amount,
-            balance_before=balance_before,
-            balance_after=balance_after,
-            transaction_type=transaction_type,
-            source=source,
-            related_user_id=related_user_id,
-            reference_id=reference_id,
-            metadata_json=metadata_json,
-        )
+            if existing is not None:
+                return existing
 
-        self.session.add(transaction)
+            # ----------------------------------------------------------------
+            # WALLET
+            # ----------------------------------------------------------------
 
-        await self.session.flush()
+            wallet = await self.get_or_create_wallet(
+                user_id,
+                for_update=True,
+            )
 
-        return transaction
+            balance_before = wallet.balance
+            balance_after = (
+                balance_before + amount
+            )
+
+            wallet.balance = balance_after
+
+            transaction = Transaction(
+                user_id=user_id,
+                amount=amount,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                transaction_type=transaction_type,
+                source=source,
+                related_user_id=related_user_id,
+                reference_id=reference_id,
+                metadata_json=metadata_json,
+            )
+
+            self.session.add(
+                transaction
+            )
+
+            await self.session.flush()
+
+            return transaction
 
     # ========================================================================
     # REMOVE MONEY
@@ -229,7 +316,9 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction | None:
-        amount = self.normalize_amount(amount)
+        amount = self.normalize_amount(
+            amount
+        )
 
         if amount <= 0:
             raise ValueError(
@@ -246,36 +335,58 @@ class EconomyRepository:
                 "source cannot be empty."
             )
 
-        wallet = await self.get_or_create_wallet(
-            user_id,
-            for_update=True,
-        )
+        async with self._mutation_lock:
 
-        if wallet.balance < amount:
-            return None
+            # ----------------------------------------------------------------
+            # IDEMPOTENCY
+            # ----------------------------------------------------------------
 
-        balance_before = wallet.balance
-        balance_after = balance_before - amount
+            existing = await self._find_reference(
+                user_id=user_id,
+                reference_id=reference_id,
+            )
 
-        wallet.balance = balance_after
+            if existing is not None:
+                return existing
 
-        transaction = Transaction(
-            user_id=user_id,
-            amount=-amount,
-            balance_before=balance_before,
-            balance_after=balance_after,
-            transaction_type=transaction_type,
-            source=source,
-            related_user_id=related_user_id,
-            reference_id=reference_id,
-            metadata_json=metadata_json,
-        )
+            # ----------------------------------------------------------------
+            # WALLET
+            # ----------------------------------------------------------------
 
-        self.session.add(transaction)
+            wallet = await self.get_or_create_wallet(
+                user_id,
+                for_update=True,
+            )
 
-        await self.session.flush()
+            if wallet.balance < amount:
+                return None
 
-        return transaction
+            balance_before = wallet.balance
+            balance_after = (
+                balance_before - amount
+            )
+
+            wallet.balance = balance_after
+
+            transaction = Transaction(
+                user_id=user_id,
+                amount=-amount,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                transaction_type=transaction_type,
+                source=source,
+                related_user_id=related_user_id,
+                reference_id=reference_id,
+                metadata_json=metadata_json,
+            )
+
+            self.session.add(
+                transaction
+            )
+
+            await self.session.flush()
+
+            return transaction
 
     # ========================================================================
     # TRANSFER
@@ -293,14 +404,21 @@ class EconomyRepository:
         metadata_json: str | None = None,
     ) -> tuple[Transaction, Transaction] | None:
         """
-        Атомарная операция перевода.
+        Атомарный перевод между двумя пользователями.
 
-        В PostgreSQL FOR UPDATE блокирует оба кошелька.
-        Кошельки блокируются в стабильном порядке ID,
-        что уменьшает вероятность deadlock при встречных переводах.
+        Внутри одного процесса операции сериализуются
+        через _mutation_lock.
+
+        На PostgreSQL дополнительно используются
+        row-level locks.
+
+        На SQLite основной механизм защиты —
+        _mutation_lock.
         """
 
-        amount = self.normalize_amount(amount)
+        amount = self.normalize_amount(
+            amount
+        )
 
         if amount <= 0:
             raise ValueError(
@@ -322,91 +440,157 @@ class EconomyRepository:
                 "source cannot be empty."
             )
 
-        first_id = min(
-            sender_id,
-            receiver_id,
-        )
+        async with self._mutation_lock:
 
-        second_id = max(
-            sender_id,
-            receiver_id,
-        )
+            # ----------------------------------------------------------------
+            # IDEMPOTENCY
+            # ----------------------------------------------------------------
 
-        first_wallet = await self.get_or_create_wallet(
-            first_id,
-            for_update=True,
-        )
+            sender_existing = await self._find_reference(
+                user_id=sender_id,
+                reference_id=reference_id,
+            )
 
-        second_wallet = await self.get_or_create_wallet(
-            second_id,
-            for_update=True,
-        )
+            receiver_existing = await self._find_reference(
+                user_id=receiver_id,
+                reference_id=reference_id,
+            )
 
-        if sender_id == first_id:
-            sender_wallet = first_wallet
-            receiver_wallet = second_wallet
-        else:
-            sender_wallet = second_wallet
-            receiver_wallet = first_wallet
+            if (
+                sender_existing is not None
+                and receiver_existing is not None
+            ):
+                return (
+                    sender_existing,
+                    receiver_existing,
+                )
 
-        if sender_wallet.balance < amount:
-            return None
+            # Если существует только одна сторона,
+            # значит операция находится в неконсистентном состоянии.
+            #
+            # Продолжать нельзя, иначе можно создать
+            # двойное списание/начисление.
 
-        # --------------------------------------------------------------------
-        # SENDER
-        # --------------------------------------------------------------------
+            if (
+                sender_existing is not None
+                or receiver_existing is not None
+            ):
+                raise RuntimeError(
+                    "Transfer reference already exists "
+                    "for only one side of the transaction."
+                )
 
-        sender_before = sender_wallet.balance
-        sender_after = sender_before - amount
+            # ----------------------------------------------------------------
+            # LOCK ORDER
+            # ----------------------------------------------------------------
 
-        sender_wallet.balance = sender_after
+            first_id = min(
+                sender_id,
+                receiver_id,
+            )
 
-        sender_transaction = Transaction(
-            user_id=sender_id,
-            amount=-amount,
-            balance_before=sender_before,
-            balance_after=sender_after,
-            transaction_type=transaction_type,
-            source=source,
-            related_user_id=receiver_id,
-            reference_id=reference_id,
-            metadata_json=metadata_json,
-        )
+            second_id = max(
+                sender_id,
+                receiver_id,
+            )
 
-        # --------------------------------------------------------------------
-        # RECEIVER
-        # --------------------------------------------------------------------
+            first_wallet = (
+                await self.get_or_create_wallet(
+                    first_id,
+                    for_update=True,
+                )
+            )
 
-        receiver_before = receiver_wallet.balance
-        receiver_after = receiver_before + amount
+            second_wallet = (
+                await self.get_or_create_wallet(
+                    second_id,
+                    for_update=True,
+                )
+            )
 
-        receiver_wallet.balance = receiver_after
+            if sender_id == first_id:
+                sender_wallet = first_wallet
+                receiver_wallet = second_wallet
+            else:
+                sender_wallet = second_wallet
+                receiver_wallet = first_wallet
 
-        receiver_transaction = Transaction(
-            user_id=receiver_id,
-            amount=amount,
-            balance_before=receiver_before,
-            balance_after=receiver_after,
-            transaction_type=transaction_type,
-            source=source,
-            related_user_id=sender_id,
-            reference_id=reference_id,
-            metadata_json=metadata_json,
-        )
+            # ----------------------------------------------------------------
+            # BALANCE CHECK
+            # ----------------------------------------------------------------
 
-        self.session.add_all(
-            [
+            if sender_wallet.balance < amount:
+                return None
+
+            # ----------------------------------------------------------------
+            # SENDER
+            # ----------------------------------------------------------------
+
+            sender_before = (
+                sender_wallet.balance
+            )
+
+            sender_after = (
+                sender_before - amount
+            )
+
+            sender_wallet.balance = (
+                sender_after
+            )
+
+            sender_transaction = Transaction(
+                user_id=sender_id,
+                amount=-amount,
+                balance_before=sender_before,
+                balance_after=sender_after,
+                transaction_type=transaction_type,
+                source=source,
+                related_user_id=receiver_id,
+                reference_id=reference_id,
+                metadata_json=metadata_json,
+            )
+
+            # ----------------------------------------------------------------
+            # RECEIVER
+            # ----------------------------------------------------------------
+
+            receiver_before = (
+                receiver_wallet.balance
+            )
+
+            receiver_after = (
+                receiver_before + amount
+            )
+
+            receiver_wallet.balance = (
+                receiver_after
+            )
+
+            receiver_transaction = Transaction(
+                user_id=receiver_id,
+                amount=amount,
+                balance_before=receiver_before,
+                balance_after=receiver_after,
+                transaction_type=transaction_type,
+                source=source,
+                related_user_id=sender_id,
+                reference_id=reference_id,
+                metadata_json=metadata_json,
+            )
+
+            self.session.add_all(
+                [
+                    sender_transaction,
+                    receiver_transaction,
+                ]
+            )
+
+            await self.session.flush()
+
+            return (
                 sender_transaction,
                 receiver_transaction,
-            ]
-        )
-
-        await self.session.flush()
-
-        return (
-            sender_transaction,
-            receiver_transaction,
-        )
+            )
 
     # ========================================================================
     # GEMS
@@ -416,7 +600,9 @@ class EconomyRepository:
         self,
         user_id: int,
     ) -> int:
-        wallet = await self.get_wallet(user_id)
+        wallet = await self.get_wallet(
+            user_id
+        )
 
         if wallet is None:
             return 0
@@ -434,16 +620,17 @@ class EconomyRepository:
                 "Gem amount must be greater than zero."
             )
 
-        wallet = await self.get_or_create_wallet(
-            user_id,
-            for_update=True,
-        )
+        async with self._mutation_lock:
+            wallet = await self.get_or_create_wallet(
+                user_id,
+                for_update=True,
+            )
 
-        wallet.gems += amount
+            wallet.gems += amount
 
-        await self.session.flush()
+            await self.session.flush()
 
-        return wallet
+            return wallet
 
     async def remove_gems(
         self,
@@ -456,19 +643,20 @@ class EconomyRepository:
                 "Gem amount must be greater than zero."
             )
 
-        wallet = await self.get_or_create_wallet(
-            user_id,
-            for_update=True,
-        )
+        async with self._mutation_lock:
+            wallet = await self.get_or_create_wallet(
+                user_id,
+                for_update=True,
+            )
 
-        if wallet.gems < amount:
-            return False
+            if wallet.gems < amount:
+                return False
 
-        wallet.gems -= amount
+            wallet.gems -= amount
 
-        await self.session.flush()
+            await self.session.flush()
 
-        return True
+            return True
 
     # ========================================================================
     # TRANSACTION HISTORY
@@ -530,7 +718,9 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
-        amount = self.normalize_amount(amount)
+        amount = self.normalize_amount(
+            amount
+        )
 
         if amount == 0:
             raise ValueError(
