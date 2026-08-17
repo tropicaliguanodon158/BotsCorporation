@@ -21,17 +21,22 @@ class UserMiddleware(BaseMiddleware):
     """
     Middleware автоматической регистрации пользователей.
 
-    Дополнительно для обычных сообщений:
+    Для каждого пользователя:
+        - создаёт/обновляет пользователя;
+        - для обычных сообщений фиксирует активность;
+        - выдаёт награду за сообщение.
 
-        - фиксирует активность;
-        - обновляет счётчики сообщений;
-        - выдаёт награду;
-        - выдаёт XP.
+    ВАЖНО:
 
-    Все операции выполняются в рамках той же транзакции,
-    которую создаёт DatabaseMiddleware.
+        XP за сообщение выдаётся RewardsService.
 
-    Никаких сообщений пользователю middleware не отправляет.
+        EventsService отвечает за:
+            - счётчики сообщений;
+            - UserDailyActivity.
+
+        Commands (/start, /daily, /hourly и т.д.)
+        НЕ считаются обычной активностью и НЕ получают
+        автоматическую награду.
     """
 
     async def __call__(
@@ -109,6 +114,17 @@ class UserMiddleware(BaseMiddleware):
         # ====================================================================
 
         if isinstance(event, Message):
+
+            # ----------------------------------------------------------------
+            # Команды не являются обычной активностью.
+            # ----------------------------------------------------------------
+
+            if self._is_command(event):
+                return await handler(
+                    event,
+                    data,
+                )
+
             chat_id = event.chat.id
 
             message_type = self._get_message_type(
@@ -124,11 +140,23 @@ class UserMiddleware(BaseMiddleware):
                 tasks_repository=tasks_repository,
             )
 
+            # ----------------------------------------------------------------
+            # Счётчики и дневная активность.
+            #
+            # XP здесь НЕ выдаём.
+            # XP за сообщение выдаёт RewardsService.
+            # ----------------------------------------------------------------
+
             await events_service.on_message(
                 user_id=telegram_user.id,
                 message_type=message_type,
                 activity_date=datetime.now().date(),
+                xp=0,
             )
+
+            # ----------------------------------------------------------------
+            # Экономическая награда.
+            # ----------------------------------------------------------------
 
             rewards_service = RewardsService(
                 economy_repository=EconomyRepository(
@@ -164,7 +192,7 @@ class UserMiddleware(BaseMiddleware):
         event: TelegramObject,
     ) -> TelegramUser | None:
         """
-        Извлекает Telegram User из события.
+        Извлечь Telegram User из события.
         """
 
         telegram_user = getattr(
@@ -180,6 +208,38 @@ class UserMiddleware(BaseMiddleware):
             return telegram_user
 
         return None
+
+    # ========================================================================
+    # COMMAND CHECK
+    # ========================================================================
+
+    @staticmethod
+    def _is_command(
+        message: Message,
+    ) -> bool:
+        """
+        Определить, является ли сообщение командой.
+
+        Учитываем как:
+            /start
+            /daily
+            /balance
+
+        так и:
+            /start@bot_username
+        """
+
+        if not message.text:
+            return False
+
+        text = message.text.strip()
+
+        if not text.startswith("/"):
+            return False
+
+        first_word = text.split(maxsplit=1)[0]
+
+        return first_word.startswith("/")
 
     # ========================================================================
     # MESSAGE TYPE
