@@ -7,29 +7,22 @@ from aiogram.types import CallbackQuery, Message, TelegramObject
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models.admin import Admin
+from app.database.models.admin import ChatAdmin, AdminLevel
 
 
 class AdminFilter(BaseFilter):
     """
-    Фильтр внутреннего администратора бота.
+    Проверка административного уровня пользователя
+    в конкретном чате.
 
-    Уровень администратора хранится в БД, а не определяется
-    Telegram-ролью.
+    required_level:
+        1 = минимальный административный доступ
+        2 = выше
+        ...
+        5 = максимальный стандартный уровень
 
-    Пример:
-
-        level = 1 -> Стажёр
-        level = 2 -> Модератор
-        level = 3 -> Старший модератор
-        level = 4 -> Верховный модератор
-        level = 5 -> Главный администратор
-
-    Названия и возможности уровней в дальнейшем будут
-    полностью настраиваться через Founder Panel.
-
-    Founder сюда не относится:
-        Founder имеет отдельный FounderFilter.
+    Founder не проверяется здесь.
+    Founder имеет отдельный FounderFilter.
     """
 
     def __init__(
@@ -49,14 +42,12 @@ class AdminFilter(BaseFilter):
         *args: Any,
         **kwargs: Any,
     ) -> bool:
-        """
-        Проверяет, обладает ли пользователь необходимым
-        внутренним административным уровнем.
-        """
-
         session = kwargs.get("session")
 
-        if not isinstance(session, AsyncSession):
+        if not isinstance(
+            session,
+            AsyncSession,
+        ):
             return False
 
         user_id = self._get_user_id(event)
@@ -64,56 +55,51 @@ class AdminFilter(BaseFilter):
         if user_id is None:
             return False
 
-        admin = await self._get_admin(
-            session=session,
-            user_id=user_id,
-        )
+        chat_id = self._get_chat_id(event)
 
-        if admin is None:
+        if chat_id is None:
             return False
-
-        if not admin.is_active:
-            return False
-
-        return admin.level >= self.required_level
-
-    @staticmethod
-    async def _get_admin(
-        session: AsyncSession,
-        user_id: int,
-    ) -> Admin | None:
-        """
-        Получает административную запись пользователя.
-        """
 
         result = await session.execute(
-            select(Admin).where(
-                Admin.user_id == user_id,
-                Admin.is_active.is_(True),
+            select(ChatAdmin)
+            .join(
+                AdminLevel,
+                AdminLevel.id
+                == ChatAdmin.admin_level_id,
             )
+            .where(
+                ChatAdmin.user_id == user_id,
+                ChatAdmin.chat_id == chat_id,
+                ChatAdmin.is_active.is_(True),
+                AdminLevel.is_active.is_(True),
+                AdminLevel.level
+                >= self.required_level,
+            )
+            .limit(1)
         )
 
-        return result.scalar_one_or_none()
+        return (
+            result.scalar_one_or_none()
+            is not None
+        )
 
     @staticmethod
     def _get_user_id(
         event: TelegramObject,
     ) -> int | None:
-        """
-        Получает Telegram ID пользователя из события.
-        """
-
         if isinstance(event, Message):
-            if event.from_user is not None:
-                return event.from_user.id
-
-            return None
+            return (
+                event.from_user.id
+                if event.from_user is not None
+                else None
+            )
 
         if isinstance(event, CallbackQuery):
-            if event.from_user is not None:
-                return event.from_user.id
-
-            return None
+            return (
+                event.from_user.id
+                if event.from_user is not None
+                else None
+            )
 
         telegram_user = getattr(
             event,
@@ -121,11 +107,48 @@ class AdminFilter(BaseFilter):
             None,
         )
 
-        if telegram_user is None:
-            return None
-
         return getattr(
             telegram_user,
             "id",
             None,
         )
+
+    @staticmethod
+    def _get_chat_id(
+        event: TelegramObject,
+    ) -> int | None:
+        if isinstance(event, Message):
+            if event.chat is not None:
+                return event.chat.id
+
+            return None
+
+        if isinstance(event, CallbackQuery):
+            message = event.message
+
+            if message is not None:
+                chat = getattr(
+                    message,
+                    "chat",
+                    None,
+                )
+
+                if chat is not None:
+                    return chat.id
+
+            return None
+
+        chat = getattr(
+            event,
+            "chat",
+            None,
+        )
+
+        if chat is not None:
+            return getattr(
+                chat,
+                "id",
+                None,
+            )
+
+        return None

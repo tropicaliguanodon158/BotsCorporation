@@ -12,24 +12,15 @@ class FounderFilter(BaseFilter):
     """
     Фильтр основателя бота.
 
-    Доступ разрешён только Telegram-пользователю,
-    чей ID указан в конфигурации приложения.
+    Founder определяется исключительно по Telegram ID,
+    указанному в конфигурации.
 
-    Важно:
-
-        Founder != Telegram administrator
-
-    Основатель определяется именно по Telegram ID.
-
-    Это означает, что даже если человек:
-        - администратор чата;
-        - владелец группы;
-        - получил высокий игровой ранг;
-        - имеет максимальный уровень модерации;
-
-    он НЕ становится основателем автоматически.
-
-    Founder ID задаётся в .env.
+    Founder не зависит от:
+        - Telegram-роли в чате;
+        - ChatAdmin;
+        - AdminLevel;
+        - игровых рангов;
+        - permissions.
     """
 
     async def __call__(
@@ -38,18 +29,7 @@ class FounderFilter(BaseFilter):
         *args: Any,
         **kwargs: Any,
     ) -> bool:
-        """
-        Проверяет Telegram ID отправителя события.
-        """
-
-        founder_id = settings.founder_id
-
-        # Founder ID обязан быть задан.
-        #
-        # Если его нет, Founder Panel полностью закрыт.
-        #
-        # Это безопаснее, чем случайно разрешить доступ
-        # кому-либо.
+        founder_id = settings.FOUNDER_ID
 
         if founder_id is None:
             return False
@@ -65,16 +45,6 @@ class FounderFilter(BaseFilter):
     def _get_user_id(
         event: TelegramObject,
     ) -> int | None:
-        """
-        Получает Telegram ID пользователя из события.
-
-        Поддерживаем:
-            Message
-            CallbackQuery
-
-        И оставляем fallback для других Telegram events.
-        """
-
         if isinstance(event, Message):
             if event.from_user is not None:
                 return event.from_user.id
