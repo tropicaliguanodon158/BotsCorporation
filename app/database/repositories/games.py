@@ -577,8 +577,15 @@ class GamesRepository:
         payout: Decimal | int | float | str = Decimal("0.00"),
     ) -> GamePlayer | None:
         """
-        Установить результат участника.
-
+        Установить результат участника игры.
+    
+        Одновременно синхронизирует:
+            GamePlayer.result
+            GamePlayer.payout
+            GameBet.payout
+    
+        Это важно для корректной истории ставок.
+    
         result:
             winner
             loser
@@ -586,7 +593,7 @@ class GamesRepository:
             bust
             cancelled
         """
-
+    
         allowed_results = {
             "winner",
             "loser",
@@ -594,34 +601,61 @@ class GamesRepository:
             "bust",
             "cancelled",
         }
-
+    
         if result not in allowed_results:
             raise ValueError(
                 f"Unsupported player result: {result}"
             )
-
-        payout = Decimal(str(payout))
-
+    
+        try:
+            payout = Decimal(str(payout))
+        except Exception as exc:
+            raise ValueError(
+                "Invalid player payout."
+            ) from exc
+    
+        if not payout.is_finite():
+            raise ValueError(
+                "Player payout must be finite."
+            )
+    
+        payout = payout.quantize(
+            Decimal("0.01")
+        )
+    
         if payout < 0:
             raise ValueError(
                 "Player payout cannot be negative."
             )
-
+    
         player = await self.get_player(
             game_id=game_id,
             user_id=user_id,
         )
-
+    
         if player is None:
             return None
-
+    
+        bet = await self.get_user_bet(
+            game_id=game_id,
+            user_id=user_id,
+        )
+    
+        if bet is None:
+            raise RuntimeError(
+                "GamePlayer exists without corresponding GameBet."
+            )
+    
         player.result = result
         player.payout = payout
-
+    
+        bet.payout = payout
+    
         await self.session.flush()
-
+    
         return player
-
+    
+    
     # ========================================================================
     # GAME BETS
     # ========================================================================

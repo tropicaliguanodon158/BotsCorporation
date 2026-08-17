@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from datetime import datetime
 import asyncio
 import random
 from decimal import Decimal, InvalidOperation
@@ -133,7 +133,7 @@ class GamesService:
             )
 
         return result
-
+    
     @staticmethod
     def _bet_reference(
         round_id: str,
@@ -142,7 +142,8 @@ class GamesService:
         return (
             f"{round_id}:bet:{user_id}"
         )
-
+    
+    
     @staticmethod
     def _payout_reference(
         round_id: str,
@@ -152,6 +153,16 @@ class GamesService:
         return (
             f"{round_id}:payout:"
             f"{game_type}:{user_id}"
+        )
+    
+    
+    @staticmethod
+    def _refund_reference(
+        round_id: str,
+        user_id: int,
+    ) -> str:
+        return (
+            f"{round_id}:refund:{user_id}"
         )
 
     @classmethod
@@ -265,21 +276,83 @@ class GamesService:
         )
 
     async def cancel(
-        self,
-        game_id: int,
-    ) -> Game:
-        async with self._game_lock:
-            game = await self.repository.cancel_game(
-                game_id
+    self,
+    game_id: int,
+) -> Game:
+    """
+    Безопасно отменить игру.
+
+    Возвращает игрокам все поставленные деньги,
+    синхронизирует результаты GamePlayer/GameBet
+    и переводит игру в cancelled.
+
+    Все изменения выполняются в одной transaction.
+    """
+
+    async with self._game_lock:
+        game = await self.repository.get_game(
+            game_id
+        )
+
+        if game is None:
+            raise ValueError(
+                "Game does not exist."
             )
 
-            if game is None:
-                raise ValueError(
-                    "Game does not exist."
-                )
+        if game.status not in self.ACTIVE_STATUSES:
+            raise ValueError(
+                "Only active games can be cancelled."
+            )
 
-            return game
+        bets = await self.repository.get_game_bets(
+            game_id
+        )
 
+        for bet in bets:
+            amount = self._decimal(
+                bet.amount
+            )
+
+            if amount <= 0:
+                continue
+
+            refund_reference = self._refund_reference(
+                game.round_id,
+                bet.user_id,
+            )
+
+            await self._payout(
+                user_id=bet.user_id,
+                amount=amount,
+                source=f"game:{game.game_type}:refund",
+                reference_id=refund_reference,
+            )
+
+            player = await self.repository.get_player(
+                game_id=game.id,
+                user_id=bet.user_id,
+            )
+
+            if player is not None:
+                player.result = "cancelled"
+                player.payout = amount
+
+            bet.payout = amount
+
+        updated_game = await self.repository.update_game(
+            game.id,
+            pot=Decimal("0.00"),
+            status="cancelled",
+            finished_at=datetime.now(),
+        )
+
+        if updated_game is None:
+            raise RuntimeError(
+                "Game disappeared while cancelling."
+            )
+
+        return updated_game
+        
     async def join(
         self,
         *,
