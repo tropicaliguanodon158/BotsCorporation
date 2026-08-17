@@ -1,39 +1,8 @@
-"""
-Rewards service.
-
-Бизнес-логика системы наград.
-
-Отвечает за:
-    - награду за сообщение;
-    - награду за фото;
-    - награду за видео;
-    - часовую награду;
-    - ежедневную награду;
-    - произвольные награды;
-    - начисление валюты;
-    - начисление гемов;
-    - начисление XP.
-
-Repository:
-    - EconomyRepository -> деньги / гемы / транзакции;
-    - SettingsRepository -> настройки чата;
-    - UserRepository -> XP и данные пользователя.
-
-Service:
-    - определяет размер награды;
-    - получает настройки;
-    - применяет бизнес-правила;
-    - вызывает repositories;
-    - не содержит SQL;
-    - не работает напрямую с Telegram API;
-    - не выполняет commit() / rollback().
-
-Транзакция управляется уровнем middleware/application.
-"""
-
+```python
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -42,60 +11,38 @@ from app.database.repositories.settings import SettingsRepository
 from app.database.repositories.users import UserRepository
 
 
-# ============================================================================
-# RESULT
-# ============================================================================
-
-
 @dataclass(slots=True)
 class RewardResult:
-    """
-    Результат выдачи награды.
-    """
-
     user_id: int
-
     chat_id: int | None
-
     currency: Decimal = Decimal("0.00")
-
     gems: int = 0
-
     xp: int = 0
-
     source: str = ""
-
     rewarded: bool = False
-
     reason: str | None = None
-
-
-# ============================================================================
-# SERVICE
-# ============================================================================
 
 
 class RewardsService:
     """
-    Сервис системы наград.
+    Единый сервис наград.
 
-    Основные сценарии:
+    Отвечает за:
+        - награду за сообщения;
+        - фото;
+        - видео;
+        - hourly;
+        - daily;
+        - произвольные награды;
+        - валюту;
+        - гемы;
+        - XP.
 
-        message_reward()
-        photo_reward()
-        video_reward()
-        hourly_reward()
-        daily_reward()
-        custom_reward()
-
-    Сервис не знает о Telegram API.
-
-    Он получает уже подготовленные данные от handler/service
-    и изменяет состояние через repositories.
+    commit / rollback выполняются DatabaseMiddleware.
     """
 
     # ========================================================================
-    # DEFAULT SETTINGS
+    # DEFAULTS
     # ========================================================================
 
     DEFAULT_MESSAGE_REWARD = Decimal("1.00")
@@ -109,6 +56,8 @@ class RewardsService:
     DEFAULT_MESSAGE_GEMS = 0
     DEFAULT_PHOTO_GEMS = 0
     DEFAULT_VIDEO_GEMS = 0
+
+    DEFAULT_MESSAGE_COOLDOWN = 10
 
     DEFAULT_HOURLY_REWARD = Decimal("25.00")
     DEFAULT_HOURLY_XP = 10
@@ -125,6 +74,7 @@ class RewardsService:
     SETTING_MESSAGE_REWARD = "rewards.message.currency"
     SETTING_MESSAGE_XP = "rewards.message.xp"
     SETTING_MESSAGE_GEMS = "rewards.message.gems"
+    SETTING_MESSAGE_COOLDOWN = "rewards.message.cooldown"
 
     SETTING_PHOTO_REWARD = "rewards.photo.currency"
     SETTING_PHOTO_XP = "rewards.photo.xp"
@@ -158,8 +108,13 @@ class RewardsService:
         self.users = user_repository
 
     # ========================================================================
-    # INTERNAL HELPERS
+    # HELPERS
     # ========================================================================
+
+    @staticmethod
+    def _validate_user_id(user_id: int) -> None:
+        if user_id <= 0:
+            raise ValueError("Invalid user_id.")
 
     async def _get_setting(
         self,
@@ -168,13 +123,6 @@ class RewardsService:
         key: str,
         default: Any,
     ) -> Any:
-        """
-        Получить настройку конкретного чата.
-
-        Если chat_id отсутствует или чат ещё не зарегистрирован,
-        возвращается default.
-        """
-
         if chat_id is None:
             return default
 
@@ -189,60 +137,135 @@ class RewardsService:
         value: Any,
         default: Decimal = Decimal("0.00"),
     ) -> Decimal:
-        """
-        Безопасно преобразовать значение в Decimal.
-        """
-
         if value is None:
             return default
 
         try:
             result = Decimal(str(value))
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except (TypeError, ValueError):
             return default
 
         if not result.is_finite():
             return default
 
-        return result.quantize(
-            Decimal("0.01")
-        )
+        return result.quantize(Decimal("0.01"))
 
     @staticmethod
     def _int(
         value: Any,
         default: int = 0,
     ) -> int:
-        """
-        Безопасно преобразовать значение в int.
-        """
-
         if value is None:
             return default
 
         try:
             return int(value)
-        except (
-            TypeError,
-            ValueError,
-        ):
+        except (TypeError, ValueError):
             return default
 
     @staticmethod
-    def _validate_user_id(
-        user_id: int,
-    ) -> None:
+    def _now() -> datetime:
+        return datetime.now()
+
+    @staticmethod
+    def _normalize_datetime(value: datetime) -> datetime:
         """
-        Проверить Telegram user ID.
+        SQLite может вернуть naive datetime,
+        PostgreSQL — timezone-aware.
+
+        Приводим оба варианта к naive UTC-подобному
+        сравнению без изменения самого значения.
         """
 
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
+        if value.tzinfo is not None:
+            return value.replace(tzinfo=None)
+
+        return value
+
+    async def _has_recent_transaction(
+        self,
+        *,
+        user_id: int,
+        source: str,
+        since: datetime,
+    ) -> bool:
+        """
+        Проверить, была ли недавно транзакция указанного типа.
+
+        Используем финансовую историю как источник истины.
+        Отдельная таблица cooldown для этого не нужна.
+        """
+
+        transactions = await self.economy.get_transactions(
+            user_id=user_id,
+            limit=100,
+            offset=0,
+        )
+
+        since = self._normalize_datetime(since)
+
+        for transaction in transactions:
+            if transaction.source != source:
+                continue
+
+            created_at = self._normalize_datetime(
+                transaction.created_at,
             )
+
+            if created_at >= since:
+                return True
+
+        return False
+
+    async def _already_claimed_today(
+        self,
+        *,
+        user_id: int,
+        source: str,
+    ) -> bool:
+        now = self._now()
+
+        start_of_day = datetime(
+            year=now.year,
+            month=now.month,
+            day=now.day,
+        )
+
+        return await self._has_recent_transaction(
+            user_id=user_id,
+            source=source,
+            since=start_of_day,
+        )
+
+    async def _already_claimed_hourly(
+        self,
+        *,
+        user_id: int,
+    ) -> bool:
+        return await self._has_recent_transaction(
+            user_id=user_id,
+            source="hourly_reward",
+            since=self._now() - timedelta(hours=1),
+        )
+
+    async def _message_on_cooldown(
+        self,
+        *,
+        user_id: int,
+        cooldown_seconds: int,
+    ) -> bool:
+        if cooldown_seconds <= 0:
+            return False
+
+        now = self._now()
+
+        return await self._has_recent_transaction(
+            user_id=user_id,
+            source="message",
+            since=now - timedelta(
+                seconds=cooldown_seconds,
+            ),
+        )
 
     # ========================================================================
     # MESSAGE
@@ -255,23 +278,10 @@ class RewardsService:
         chat_id: int | None,
         message_type: str = "text",
     ) -> RewardResult:
-        """
-        Выдать награду за сообщение.
-
-        message_type:
-
-            text
-            photo
-            video
-            other
-        """
-
         self._validate_user_id(user_id)
 
         message_type = (
-            message_type
-            .lower()
-            .strip()
+            message_type.strip().lower()
         )
 
         if message_type == "photo":
@@ -291,6 +301,32 @@ class RewardsService:
             "other",
         }:
             message_type = "text"
+
+        cooldown = await self._get_setting(
+            chat_id=chat_id,
+            key=self.SETTING_MESSAGE_COOLDOWN,
+            default=self.DEFAULT_MESSAGE_COOLDOWN,
+        )
+
+        cooldown = max(
+            0,
+            self._int(
+                cooldown,
+                self.DEFAULT_MESSAGE_COOLDOWN,
+            ),
+        )
+
+        if await self._message_on_cooldown(
+            user_id=user_id,
+            cooldown_seconds=cooldown,
+        ):
+            return RewardResult(
+                user_id=user_id,
+                chat_id=chat_id,
+                source="message",
+                rewarded=False,
+                reason="cooldown",
+            )
 
         currency = await self._get_setting(
             chat_id=chat_id,
@@ -338,10 +374,6 @@ class RewardsService:
         user_id: int,
         chat_id: int | None,
     ) -> RewardResult:
-        """
-        Выдать награду за фотографию.
-        """
-
         self._validate_user_id(user_id)
 
         currency = await self._get_setting(
@@ -390,10 +422,6 @@ class RewardsService:
         user_id: int,
         chat_id: int | None,
     ) -> RewardResult:
-        """
-        Выдать награду за видео.
-        """
-
         self._validate_user_id(user_id)
 
         currency = await self._get_setting(
@@ -442,20 +470,18 @@ class RewardsService:
         user_id: int,
         chat_id: int | None,
     ) -> RewardResult:
-        """
-        Выдать часовую награду.
-
-        Проверка cooldown здесь НЕ выполняется.
-
-        Этот метод отвечает за размер и фактическую выдачу
-        награды.
-
-        Проверка возможности получения hourly reward
-        будет находиться в соответствующем service/handler
-        после подключения activity/cooldown механики.
-        """
-
         self._validate_user_id(user_id)
+
+        if await self._already_claimed_hourly(
+            user_id=user_id,
+        ):
+            return RewardResult(
+                user_id=user_id,
+                chat_id=chat_id,
+                source="hourly_reward",
+                rewarded=False,
+                reason="cooldown",
+            )
 
         currency = await self._get_setting(
             chat_id=chat_id,
@@ -503,14 +529,19 @@ class RewardsService:
         user_id: int,
         chat_id: int | None,
     ) -> RewardResult:
-        """
-        Выдать ежедневную награду.
-
-        Проверка "получал ли пользователь сегодня"
-        находится за пределами этого метода.
-        """
-
         self._validate_user_id(user_id)
+
+        if await self._already_claimed_today(
+            user_id=user_id,
+            source="daily_reward",
+        ):
+            return RewardResult(
+                user_id=user_id,
+                chat_id=chat_id,
+                source="daily_reward",
+                rewarded=False,
+                reason="already_claimed",
+            )
 
         currency = await self._get_setting(
             chat_id=chat_id,
@@ -562,19 +593,6 @@ class RewardsService:
         gems: int = 0,
         source: str = "custom_reward",
     ) -> RewardResult:
-        """
-        Универсальная выдача награды.
-
-        Используется для:
-
-            - заданий;
-            - достижений;
-            - событий;
-            - административных наград;
-            - игровых механик;
-            - специальных событий.
-        """
-
         self._validate_user_id(user_id)
 
         if not source or not source.strip():
@@ -583,9 +601,7 @@ class RewardsService:
             )
 
         currency = self._decimal(currency)
-
         xp = self._int(xp)
-
         gems = self._int(gems)
 
         if currency < 0:
@@ -626,14 +642,6 @@ class RewardsService:
         gems: int,
         source: str,
     ) -> RewardResult:
-        """
-        Фактически выдать награду.
-
-        Все изменения выполняются через repositories.
-
-        Никакого SQLAlchemy здесь нет.
-        """
-
         self._validate_user_id(user_id)
 
         if currency < 0:
@@ -658,32 +666,19 @@ class RewardsService:
 
         source = source.strip()
 
-        # ------------------------------------------------------------------
-        # CURRENCY
-        # ------------------------------------------------------------------
-
         if currency > 0:
             await self.economy.add_balance(
                 user_id=user_id,
                 amount=currency,
                 transaction_type="reward",
                 source=source,
-                reference_id=None,
             )
-
-        # ------------------------------------------------------------------
-        # GEMS
-        # ------------------------------------------------------------------
 
         if gems > 0:
             await self.economy.add_gems(
                 user_id=user_id,
                 amount=gems,
             )
-
-        # ------------------------------------------------------------------
-        # XP
-        # ------------------------------------------------------------------
 
         if xp > 0:
             user = await self.users.add_xp(
@@ -695,10 +690,6 @@ class RewardsService:
                 raise ValueError(
                     f"User {user_id} does not exist."
                 )
-
-        # ------------------------------------------------------------------
-        # RESULT
-        # ------------------------------------------------------------------
 
         rewarded = (
             currency > 0
@@ -714,5 +705,10 @@ class RewardsService:
             xp=xp,
             source=source,
             rewarded=rewarded,
-            reason=None if rewarded else "empty_reward",
+            reason=(
+                None
+                if rewarded
+                else "empty_reward"
+            ),
         )
+```
