@@ -1,21 +1,10 @@
-"""
-Economy repository.
 
-Отвечает за низкоуровневую работу с кошельками и финансовыми
-транзакциями.
-
-ВАЖНО:
-    - бизнес-правила находятся в services/economy.py;
-    - здесь нет логики рулетки, дуэли, магазина и наград;
-    - commit() намеренно не выполняется внутри методов.
-
-Все операции должны выполняться внутри транзакции сервиса.
-"""
+from __future__ import annotations
 
 from decimal import Decimal
 from typing import Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.economy import Transaction, Wallet
@@ -24,22 +13,32 @@ from app.database.models.economy import Transaction, Wallet
 class EconomyRepository:
     """
     Репозиторий экономики.
+
+    Отвечает за низкоуровневую работу с кошельками
+    и финансовыми транзакциями.
+
+    ВАЖНО:
+        - бизнес-правила находятся в services/economy.py;
+        - commit() здесь не выполняется;
+        - операции изменения баланса выполняются внутри
+          внешней транзакции сервиса;
+        - операции списания/перевода используют FOR UPDATE,
+          чтобы защитить баланс от race condition.
     """
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
     # ========================================================================
-    # INTERNAL HELPERS
+    # INTERNAL
     # ========================================================================
 
     @staticmethod
-    def normalize_amount(amount: Decimal | int | float | str) -> Decimal:
+    def normalize_amount(
+        amount: Decimal | int | float | str,
+    ) -> Decimal:
         """
-        Приводит денежное значение к Decimal.
-
-        Для финансовых операций float напрямую использовать
-        нежелательно из-за особенностей представления чисел.
+        Привести денежное значение к Decimal с двумя знаками.
         """
 
         if isinstance(amount, Decimal):
@@ -47,7 +46,14 @@ class EconomyRepository:
         else:
             result = Decimal(str(amount))
 
-        return result.quantize(Decimal("0.01"))
+        if not result.is_finite():
+            raise ValueError(
+                "Amount must be a finite number."
+            )
+
+        return result.quantize(
+            Decimal("0.01")
+        )
 
     # ========================================================================
     # WALLET
@@ -56,28 +62,44 @@ class EconomyRepository:
     async def get_wallet(
         self,
         user_id: int,
+        *,
+        for_update: bool = False,
     ) -> Wallet | None:
         """
         Получить кошелёк пользователя.
+
+        for_update=True блокирует существующую строку
+        до окончания текущей DB-транзакции.
         """
 
-        result = await self.session.execute(
-            select(Wallet).where(
-                Wallet.user_id == user_id,
-            )
+        query = select(Wallet).where(
+            Wallet.user_id == user_id,
         )
+
+        if for_update:
+            query = query.with_for_update()
+
+        result = await self.session.execute(query)
 
         return result.scalar_one_or_none()
 
     async def get_or_create_wallet(
         self,
         user_id: int,
+        *,
+        for_update: bool = False,
     ) -> Wallet:
         """
-        Получить существующий кошелёк или создать новый.
+        Получить кошелёк или создать новый.
+
+        Если кошелёк существует и for_update=True,
+        строка блокируется.
         """
 
-        wallet = await self.get_wallet(user_id)
+        wallet = await self.get_wallet(
+            user_id,
+            for_update=for_update,
+        )
 
         if wallet is not None:
             return wallet
@@ -102,12 +124,6 @@ class EconomyRepository:
         self,
         user_id: int,
     ) -> Decimal:
-        """
-        Получить баланс пользователя.
-
-        Если кошелька ещё нет — возвращается 0.
-        """
-
         wallet = await self.get_wallet(user_id)
 
         if wallet is None:
@@ -120,21 +136,17 @@ class EconomyRepository:
         user_id: int,
         amount: Decimal | int | float | str,
     ) -> Wallet:
-        """
-        Установить баланс напрямую.
-
-        Используется только административными/сервисными операциями.
-
-        Обычные операции должны использовать add_balance() или
-        remove_balance().
-        """
-
         amount = self.normalize_amount(amount)
 
         if amount < 0:
-            raise ValueError("Balance cannot be negative.")
+            raise ValueError(
+                "Balance cannot be negative."
+            )
 
-        wallet = await self.get_or_create_wallet(user_id)
+        wallet = await self.get_or_create_wallet(
+            user_id,
+            for_update=True,
+        )
 
         wallet.balance = amount
 
@@ -157,21 +169,6 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
-        """
-        Начислить деньги пользователю.
-
-        Возвращает созданную финансовую транзакцию.
-
-        Пример:
-
-            await repository.add_balance(
-                user_id=123,
-                amount=10,
-                transaction_type="reward",
-                source="message",
-            )
-        """
-
         amount = self.normalize_amount(amount)
 
         if amount <= 0:
@@ -179,7 +176,20 @@ class EconomyRepository:
                 "add_balance amount must be greater than zero."
             )
 
-        wallet = await self.get_or_create_wallet(user_id)
+        if not transaction_type:
+            raise ValueError(
+                "transaction_type cannot be empty."
+            )
+
+        if not source:
+            raise ValueError(
+                "source cannot be empty."
+            )
+
+        wallet = await self.get_or_create_wallet(
+            user_id,
+            for_update=True,
+        )
 
         balance_before = wallet.balance
         balance_after = balance_before + amount
@@ -219,13 +229,6 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction | None:
-        """
-        Списать деньги у пользователя.
-
-        Если денег недостаточно — операция НЕ выполняется
-        и возвращается None.
-        """
-
         amount = self.normalize_amount(amount)
 
         if amount <= 0:
@@ -233,9 +236,20 @@ class EconomyRepository:
                 "remove_balance amount must be greater than zero."
             )
 
-        wallet = await self.get_or_create_wallet(user_id)
+        if not transaction_type:
+            raise ValueError(
+                "transaction_type cannot be empty."
+            )
 
-        # Проверяем баланс.
+        if not source:
+            raise ValueError(
+                "source cannot be empty."
+            )
+
+        wallet = await self.get_or_create_wallet(
+            user_id,
+            for_update=True,
+        )
 
         if wallet.balance < amount:
             return None
@@ -279,15 +293,11 @@ class EconomyRepository:
         metadata_json: str | None = None,
     ) -> tuple[Transaction, Transaction] | None:
         """
-        Перевести деньги между двумя пользователями.
+        Атомарная операция перевода.
 
-        Возвращает:
-
-            (transaction_sender, transaction_receiver)
-
-        либо None, если у отправителя недостаточно средств.
-
-        Сам commit() здесь НЕ выполняется.
+        В PostgreSQL FOR UPDATE блокирует оба кошелька.
+        Кошельки блокируются в стабильном порядке ID,
+        что уменьшает вероятность deadlock при встречных переводах.
         """
 
         amount = self.normalize_amount(amount)
@@ -302,19 +312,49 @@ class EconomyRepository:
                 "Sender and receiver cannot be the same user."
             )
 
-        # Получаем кошельки.
+        if not transaction_type:
+            raise ValueError(
+                "transaction_type cannot be empty."
+            )
 
-        sender_wallet = await self.get_or_create_wallet(sender_id)
-        receiver_wallet = await self.get_or_create_wallet(receiver_id)
+        if not source:
+            raise ValueError(
+                "source cannot be empty."
+            )
 
-        # Проверяем средства.
+        first_id = min(
+            sender_id,
+            receiver_id,
+        )
+
+        second_id = max(
+            sender_id,
+            receiver_id,
+        )
+
+        first_wallet = await self.get_or_create_wallet(
+            first_id,
+            for_update=True,
+        )
+
+        second_wallet = await self.get_or_create_wallet(
+            second_id,
+            for_update=True,
+        )
+
+        if sender_id == first_id:
+            sender_wallet = first_wallet
+            receiver_wallet = second_wallet
+        else:
+            sender_wallet = second_wallet
+            receiver_wallet = first_wallet
 
         if sender_wallet.balance < amount:
             return None
 
-        # ------------------------------------------------------------------
-        # Sender
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # SENDER
+        # --------------------------------------------------------------------
 
         sender_before = sender_wallet.balance
         sender_after = sender_before - amount
@@ -333,9 +373,9 @@ class EconomyRepository:
             metadata_json=metadata_json,
         )
 
-        # ------------------------------------------------------------------
-        # Receiver
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # RECEIVER
+        # --------------------------------------------------------------------
 
         receiver_before = receiver_wallet.balance
         receiver_after = receiver_before + amount
@@ -376,10 +416,6 @@ class EconomyRepository:
         self,
         user_id: int,
     ) -> int:
-        """
-        Получить количество гемов.
-        """
-
         wallet = await self.get_wallet(user_id)
 
         if wallet is None:
@@ -393,16 +429,15 @@ class EconomyRepository:
         user_id: int,
         amount: int,
     ) -> Wallet:
-        """
-        Начислить гемы.
-        """
-
         if amount <= 0:
             raise ValueError(
                 "Gem amount must be greater than zero."
             )
 
-        wallet = await self.get_or_create_wallet(user_id)
+        wallet = await self.get_or_create_wallet(
+            user_id,
+            for_update=True,
+        )
 
         wallet.gems += amount
 
@@ -416,18 +451,15 @@ class EconomyRepository:
         user_id: int,
         amount: int,
     ) -> bool:
-        """
-        Списать гемы.
-
-        Возвращает False при недостатке гемов.
-        """
-
         if amount <= 0:
             raise ValueError(
                 "Gem amount must be greater than zero."
             )
 
-        wallet = await self.get_or_create_wallet(user_id)
+        wallet = await self.get_or_create_wallet(
+            user_id,
+            for_update=True,
+        )
 
         if wallet.gems < amount:
             return False
@@ -439,7 +471,7 @@ class EconomyRepository:
         return True
 
     # ========================================================================
-    # TRANSACTIONS HISTORY
+    # TRANSACTION HISTORY
     # ========================================================================
 
     async def get_transactions(
@@ -449,10 +481,6 @@ class EconomyRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> Sequence[Transaction]:
-        """
-        Получить историю финансовых операций пользователя.
-        """
-
         if limit < 1:
             limit = 1
 
@@ -481,10 +509,6 @@ class EconomyRepository:
         self,
         transaction_id: int,
     ) -> Transaction | None:
-        """
-        Получить конкретную транзакцию.
-        """
-
         result = await self.session.execute(
             select(Transaction).where(
                 Transaction.id == transaction_id,
@@ -506,15 +530,6 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
-        """
-        Административная корректировка баланса.
-
-        amount > 0  -> начисление
-        amount < 0  -> списание
-
-        Нулевое изменение запрещено.
-        """
-
         amount = self.normalize_amount(amount)
 
         if amount == 0:
