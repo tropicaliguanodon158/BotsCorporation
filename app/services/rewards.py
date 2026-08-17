@@ -589,4 +589,4 @@ class RewardsService:
             xp=xp,
             source=source,
             rewarded=True,
-        )
+        ) 
