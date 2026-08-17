@@ -1,5 +1,8 @@
+
 from __future__ import annotations
 
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -11,24 +14,117 @@ from app.database.models import Base
 
 
 # ============================================================================
+# DATABASE URL
+# ============================================================================
+
+DATABASE_URL = settings.DATABASE_URL
+
+
+# ============================================================================
 # ENGINE
 # ============================================================================
 
+_engine_kwargs: dict = {
+    "echo": settings.DATABASE_ECHO,
+    "pool_pre_ping": True,
+}
+
+
+# SQLite не нуждается в большом connection pool.
+#
+# Для локального запуска на ноутбуке:
+#     - минимальное потребление памяти;
+#     - меньше открытых соединений;
+#     - WAL для лучшей конкурентности чтения/записи;
+#     - timeout вместо мгновенного "database is locked".
+#
+# Для PostgreSQL используется небольшой pool.
+if DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs.update(
+        {
+            "connect_args": {
+                "check_same_thread": False,
+                "timeout": 30,
+            },
+        }
+    )
+
+else:
+    _engine_kwargs.update(
+        {
+            "pool_size": 5,
+            "max_overflow": 2,
+            "pool_timeout": 30,
+            "pool_recycle": 1800,
+        }
+    )
+
+
 engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.DATABASE_ECHO,
-    pool_pre_ping=True,
+    DATABASE_URL,
+    **_engine_kwargs,
 )
+
+
+# ============================================================================
+# SQLITE OPTIMIZATION
+# ============================================================================
+
+
+if DATABASE_URL.startswith("sqlite"):
+
+    @event.listens_for(
+        engine.sync_engine,
+        "connect",
+    )
+    def _configure_sqlite(
+        dbapi_connection,
+        connection_record,
+    ) -> None:
+        """
+        Настройки SQLite для длительной работы бота.
+
+        WAL:
+            позволяет чтениям продолжаться во время записи.
+
+        NORMAL:
+            хороший баланс между безопасностью и скоростью.
+
+        foreign_keys:
+            обязательно включаем каскадные FK.
+        """
+
+        cursor = dbapi_connection.cursor()
+
+        cursor.execute(
+            "PRAGMA journal_mode=WAL"
+        )
+
+        cursor.execute(
+            "PRAGMA synchronous=NORMAL"
+        )
+
+        cursor.execute(
+            "PRAGMA foreign_keys=ON"
+        )
+
+        cursor.execute(
+            "PRAGMA busy_timeout=30000"
+        )
+
+        cursor.close()
 
 
 # ============================================================================
 # SESSION
 # ============================================================================
 
+
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,
+    autoflush=False,
 )
 
 
@@ -41,21 +137,12 @@ async def init_database() -> None:
     """
     Инициализирует базу данных.
 
-    Перед вызовом этой функции все модели должны быть
-    импортированы через app.database.models.
+    На этапе разработки create_all используется для
+    создания отсутствующих таблиц.
 
-    Благодаря этому Base.metadata содержит все таблицы проекта.
+    В production после стабилизации схемы необходимо
+    перейти на Alembic migrations.
     """
-
-    # Важно:
-    # импортируем models до create_all.
-    #
-    # Сам факт импорта:
-    #
-    #     from app.database.models import Base
-    #
-    # приводит к регистрации всех моделей,
-    # потому что models/__init__.py импортирует их все.
 
     async with engine.begin() as connection:
         await connection.run_sync(
@@ -70,7 +157,7 @@ async def init_database() -> None:
 
 async def close_database() -> None:
     """
-    Корректно закрывает соединения с базой данных.
+    Корректно закрывает connection pool.
     """
 
     await engine.dispose()
@@ -83,18 +170,23 @@ async def close_database() -> None:
 
 def get_session() -> AsyncSession:
     """
-    Возвращает новую AsyncSession.
+    Создаёт новую AsyncSession.
 
-    Используется сервисами и репозиториями.
+    В обычных Telegram handlers рекомендуется
+    использовать session, предоставленную
+    DatabaseMiddleware.
 
-    Пример:
-
-        session = get_session()
-
-        try:
-            ...
-        finally:
-            await session.close()
+    Этот helper оставлен для фоновых задач
+    и отдельных сервисных операций.
     """
 
     return AsyncSessionLocal()
+
+
+__all__ = [
+    "engine",
+    "AsyncSessionLocal",
+    "init_database",
+    "close_database",
+    "get_session",
+]

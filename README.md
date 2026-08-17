@@ -646,7 +646,7 @@ python -m app.main
 
 Проект:
 
-**BotsCorporation**
+**Acid/BotsCorporation**
 
 Репозиторий:
 
