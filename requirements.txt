@@ -1,5 +1,6 @@
 aiogram
 SQLAlchemy
+aiosqlite
 asyncpg
 pydantic
 pydantic-settings
