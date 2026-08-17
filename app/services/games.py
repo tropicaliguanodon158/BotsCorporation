@@ -1,27 +1,40 @@
+"""
+Games service.
+
+Бизнес-логика игровых механик.
+
+Repository:
+    GamesRepository -> игровые сессии, игроки, ставки.
+
+EconomyRepository:
+    - списание ставок;
+    - начисление выплат.
+
+Service:
+    - проверяет баланс;
+    - создаёт игру;
+    - фиксирует ставку;
+    - выполняет игру;
+    - начисляет выплату;
+    - завершает игру.
+
+commit()/rollback() здесь НЕ выполняются.
+"""
+
 from __future__ import annotations
 
 import random
 from decimal import Decimal
 from typing import Any, Sequence
 
-from app.database.models.games import Game, GameBet, GamePlayer
+from app.database.models.games import Game, GamePlayer
+from app.database.repositories.economy import EconomyRepository
 from app.database.repositories.games import GamesRepository
 
 
 class GamesService:
     """
     Игровая бизнес-логика.
-
-    Repository отвечает только за БД.
-
-    Здесь:
-        - создание игровых сессий;
-        - ставки;
-        - roulette;
-        - dice;
-        - coinflip;
-        - duel;
-        - завершение игр.
     """
 
     ACTIVE_STATUSES = {
@@ -41,8 +54,10 @@ class GamesService:
     def __init__(
         self,
         repository: GamesRepository,
+        economy_repository: EconomyRepository,
     ) -> None:
         self.repository = repository
+        self.economy = economy_repository
 
     # ========================================================================
     # COMMON
@@ -137,13 +152,11 @@ class GamesService:
             if existing is not None:
                 return existing
 
-        player = await self.repository.add_player(
+        return await self.repository.add_player(
             game_id=game_id,
             user_id=user_id,
             bet=bet,
         )
-
-        return player
 
     async def players(
         self,
@@ -152,8 +165,57 @@ class GamesService:
         return await self.repository.get_game_players(game_id)
 
     # ========================================================================
-    # BET
+    # FINANCE
     # ========================================================================
+
+    async def _charge(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal,
+        source: str,
+        reference_id: str,
+    ) -> None:
+        amount = Decimal(str(amount))
+
+        if amount <= 0:
+            raise ValueError(
+                "Bet amount must be greater than zero."
+            )
+
+        transaction = await self.economy.remove_balance(
+            user_id=user_id,
+            amount=amount,
+            transaction_type="game_bet",
+            source=source,
+            reference_id=reference_id,
+        )
+
+        if transaction is None:
+            raise ValueError(
+                "Insufficient balance."
+            )
+
+    async def _payout(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal,
+        source: str,
+        reference_id: str,
+    ) -> None:
+        amount = Decimal(str(amount))
+
+        if amount <= 0:
+            return
+
+        await self.economy.add_balance(
+            user_id=user_id,
+            amount=amount,
+            transaction_type="game_payout",
+            source=source,
+            reference_id=reference_id,
+        )
 
     async def place_bet(
         self,
@@ -163,7 +225,7 @@ class GamesService:
         amount: Decimal | int | float | str,
         bet_type: str,
         selection: str | None = None,
-    ) -> GameBet:
+    ):
         game = await self.repository.get_game(game_id)
 
         if game is None:
@@ -183,13 +245,37 @@ class GamesService:
                 "Bet amount must be greater than zero."
             )
 
-        return await self.repository.create_bet(
-            game_id=game_id,
+        await self._charge(
             user_id=user_id,
             amount=amount,
-            bet_type=bet_type,
-            selection=selection,
+            source=f"game:{game.game_type}",
+            reference_id=game.round_id,
         )
+
+        try:
+            bet = await self.repository.create_bet(
+                game_id=game_id,
+                user_id=user_id,
+                amount=amount,
+                bet_type=bet_type,
+                selection=selection,
+            )
+        except Exception:
+            await self._payout(
+                user_id=user_id,
+                amount=amount,
+                source="game_bet_rollback",
+                reference_id=game.round_id,
+            )
+            raise
+
+        game.pot += amount
+        await self.repository.update_game(
+            game.id,
+            pot=game.pot,
+        )
+
+        return bet
 
     # ========================================================================
     # DICE
@@ -214,13 +300,23 @@ class GamesService:
                 "Dice target is outside the dice range."
             )
 
+        amount = Decimal(str(bet))
+
+        if amount <= 0:
+            raise ValueError(
+                "Bet amount must be greater than zero."
+            )
+
+        if await self.economy.get_balance(user_id) < amount:
+            raise ValueError(
+                "Insufficient balance."
+            )
+
         game = await self.create(
             game_type="dice",
             creator_id=user_id,
             chat_id=chat_id,
         )
-
-        amount = Decimal(str(bet))
 
         await self.join(
             game_id=game.id,
@@ -258,14 +354,20 @@ class GamesService:
             else Decimal("0.00")
         )
 
-        result = "winner" if won else "loser"
-
         await self.repository.set_player_result(
             game_id=game.id,
             user_id=user_id,
-            result=result,
+            result="winner" if won else "loser",
             payout=payout,
         )
+
+        if won:
+            await self._payout(
+                user_id=user_id,
+                amount=payout,
+                source="game:dice",
+                reference_id=game.round_id,
+            )
 
         await self.repository.finish_game(
             game.id,
@@ -295,8 +397,6 @@ class GamesService:
         bet: Decimal | int | float | str,
         selection: str,
     ) -> dict[str, Any]:
-        selection = selection.strip().lower()
-
         aliases = {
             "орёл": "heads",
             "орел": "heads",
@@ -307,7 +407,10 @@ class GamesService:
             "t": "tails",
         }
 
-        selection = aliases.get(selection, selection)
+        selection = aliases.get(
+            selection.strip().lower(),
+            selection.strip().lower(),
+        )
 
         if selection not in {
             "heads",
@@ -318,6 +421,16 @@ class GamesService:
             )
 
         amount = Decimal(str(bet))
+
+        if amount <= 0:
+            raise ValueError(
+                "Bet amount must be greater than zero."
+            )
+
+        if await self.economy.get_balance(user_id) < amount:
+            raise ValueError(
+                "Insufficient balance."
+            )
 
         game = await self.create(
             game_type="coinflip",
@@ -361,6 +474,14 @@ class GamesService:
             payout=payout,
         )
 
+        if won:
+            await self._payout(
+                user_id=user_id,
+                amount=payout,
+                source="game:coinflip",
+                reference_id=game.round_id,
+            )
+
         await self.repository.finish_game(
             game.id,
             winner_id=user_id if won else None,
@@ -390,28 +511,7 @@ class GamesService:
     ) -> dict[str, Any]:
         selection = selection.strip().lower()
 
-        valid_colors = {
-            "red",
-            "black",
-            "green",
-            "красное",
-            "красный",
-            "черное",
-            "чёрное",
-            "черный",
-            "зелёное",
-            "зеленое",
-            "зеленый",
-            "зелёный",
-            "green",
-        }
-
-        if selection not in valid_colors:
-            raise ValueError(
-                "Invalid roulette selection."
-            )
-
-        color_aliases = {
+        aliases = {
             "красное": "red",
             "красный": "red",
             "черное": "black",
@@ -423,12 +523,31 @@ class GamesService:
             "зелёный": "green",
         }
 
-        selection = color_aliases.get(
+        selection = aliases.get(
             selection,
             selection,
         )
 
+        if selection not in {
+            "red",
+            "black",
+            "green",
+        }:
+            raise ValueError(
+                "Invalid roulette selection."
+            )
+
         amount = Decimal(str(bet))
+
+        if amount <= 0:
+            raise ValueError(
+                "Bet amount must be greater than zero."
+            )
+
+        if await self.economy.get_balance(user_id) < amount:
+            raise ValueError(
+                "Insufficient balance."
+            )
 
         game = await self.create(
             game_type="roulette",
@@ -467,10 +586,11 @@ class GamesService:
 
         won = color == selection
 
-        if selection == "green":
-            multiplier = Decimal("14.00")
-        else:
-            multiplier = Decimal("1.90")
+        multiplier = (
+            Decimal("14.00")
+            if selection == "green"
+            else Decimal("1.90")
+        )
 
         payout = (
             amount * multiplier
@@ -484,6 +604,14 @@ class GamesService:
             result="winner" if won else "loser",
             payout=payout,
         )
+
+        if won:
+            await self._payout(
+                user_id=user_id,
+                amount=payout,
+                source="game:roulette",
+                reference_id=game.round_id,
+            )
 
         await self.repository.finish_game(
             game.id,
@@ -525,6 +653,16 @@ class GamesService:
                 "Duel bet must be greater than zero."
             )
 
+        if await self.economy.get_balance(creator_id) < amount:
+            raise ValueError(
+                "Creator has insufficient balance."
+            )
+
+        if await self.economy.get_balance(opponent_id) < amount:
+            raise ValueError(
+                "Opponent has insufficient balance."
+            )
+
         game = await self.create(
             game_type="duel",
             creator_id=creator_id,
@@ -550,12 +688,16 @@ class GamesService:
             bet_type="duel",
         )
 
-        await self.place_bet(
-            game_id=game.id,
-            user_id=opponent_id,
-            amount=amount,
-            bet_type="duel",
-        )
+        try:
+            await self.place_bet(
+                game_id=game.id,
+                user_id=opponent_id,
+                amount=amount,
+                bet_type="duel",
+            )
+        except Exception:
+            await self.cancel(game.id)
+            raise
 
         await self.repository.start_game(game.id)
 
@@ -570,8 +712,6 @@ class GamesService:
             else creator_id
         )
 
-        # Победитель получает собственную ставку обратно
-        # + 50% ставки противника.
         winner_payout = (
             amount + amount * Decimal("0.50")
         )
@@ -588,6 +728,13 @@ class GamesService:
             user_id=loser_id,
             result="loser",
             payout=Decimal("0.00"),
+        )
+
+        await self._payout(
+            user_id=winner_id,
+            amount=winner_payout,
+            source="game:duel",
+            reference_id=game.round_id,
         )
 
         await self.repository.finish_game(
