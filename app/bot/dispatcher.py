@@ -3,7 +3,14 @@ from __future__ import annotations
 from aiogram import Dispatcher
 
 from app.handlers.common.start import router as start_router
+from app.handlers.common.help import router as help_router
+from app.handlers.common.profile import router as profile_router
+from app.handlers.economy.balance import router as balance_router
+from app.handlers.economy.rewards import router as rewards_router
+
 from app.middlewares.database import DatabaseMiddleware
+from app.middlewares.user import UserMiddleware
+from app.middlewares.logging import LoggingMiddleware
 
 
 def create_dispatcher() -> Dispatcher:
@@ -11,7 +18,6 @@ def create_dispatcher() -> Dispatcher:
     Создаёт главный Dispatcher приложения.
 
     Здесь собираются:
-
         - middleware;
         - пользовательские роутеры;
         - обработчики Telegram updates.
@@ -26,22 +32,39 @@ def create_dispatcher() -> Dispatcher:
     # ========================================================================
 
     dp.update.outer_middleware(
+        LoggingMiddleware(),
+    )
+
+    dp.update.outer_middleware(
         DatabaseMiddleware(),
+    )
+
+    dp.update.outer_middleware(
+        UserMiddleware(),
     )
 
     # ========================================================================
     # ROUTERS
     # ========================================================================
 
-    # Пока подключаем только реально реализованные handlers.
-    #
-    # Остальные handler-файлы проекта пока пустые, поэтому импортировать
-    # их заранее нельзя — это создаст ложное ощущение готовности системы.
-    #
-    # По мере реализации каждого модуля его router будет добавляться сюда.
-
     dp.include_router(
         start_router,
+    )
+
+    dp.include_router(
+        help_router,
+    )
+
+    dp.include_router(
+        profile_router,
+    )
+
+    dp.include_router(
+        balance_router,
+    )
+
+    dp.include_router(
+        rewards_router,
     )
 
     return dp
