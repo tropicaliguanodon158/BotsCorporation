@@ -9,13 +9,11 @@ def create_bot() -> Bot:
     """
     Создаёт и возвращает экземпляр Telegram-бота.
 
-    Отдельная функция нужна для того, чтобы объект бота
-    создавался централизованно и в дальнейшем его было
-    удобно использовать в других частях приложения.
+    Конфигурация берётся из app.config.settings.
     """
 
     bot = Bot(
-        token=settings.bot_token,
+        token=settings.BOT_TOKEN,
         default=DefaultBotProperties(
             parse_mode=ParseMode.HTML,
         ),
