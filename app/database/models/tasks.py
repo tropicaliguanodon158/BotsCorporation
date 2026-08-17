@@ -108,6 +108,15 @@ class UserDailyActivity(Base):
     )
 
     # ------------------------------------------------------------------
+    # Daily rewards
+    # ------------------------------------------------------------------
+
+    daily_reward_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # ------------------------------------------------------------------
     # Activity flags
     # ------------------------------------------------------------------
 
@@ -183,41 +192,17 @@ class Task(Base):
         nullable=False,
     )
 
-    # ------------------------------------------------------------------
-    # Task type
-    # ------------------------------------------------------------------
-
     task_type: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
         index=True,
     )
 
-    # Примеры:
-    #
-    # messages
-    # photos
-    # games
-    # wins
-    # purchases
-    # cases
-    # commands
-    # activity
-    # custom
-
-    # ------------------------------------------------------------------
-    # Target
-    # ------------------------------------------------------------------
-
     target_value: Mapped[int] = mapped_column(
         Integer,
         default=1,
         nullable=False,
     )
-
-    # ------------------------------------------------------------------
-    # Rewards
-    # ------------------------------------------------------------------
 
     reward_currency: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
@@ -243,22 +228,11 @@ class Task(Base):
         nullable=True,
     )
 
-    # ------------------------------------------------------------------
-    # Repeatability
-    # ------------------------------------------------------------------
-
     task_period: Mapped[str] = mapped_column(
         String(30),
         default="daily",
         nullable=False,
     )
-
-    # Возможные значения:
-    #
-    # once
-    # daily
-    # weekly
-    # monthly
 
     is_active: Mapped[bool] = mapped_column(
         Boolean,
@@ -328,8 +302,6 @@ class UserTask(Base):
         nullable=True,
     )
 
-    # Период, к которому относится прогресс.
-
     period_date: Mapped[date | None] = mapped_column(
         Date,
         nullable=True,
@@ -358,14 +330,6 @@ class UserTask(Base):
 class Achievement(Base):
     """
     Долгосрочное достижение.
-
-    Примеры:
-
-        Первое сообщение
-        100 сообщений
-        10 побед
-        Миллионер
-        100 открытых кейсов
     """
 
     __tablename__ = "achievements"
@@ -388,8 +352,6 @@ class Achievement(Base):
         nullable=False,
     )
 
-    # Тип условия.
-
     condition_type: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
@@ -401,8 +363,6 @@ class Achievement(Base):
         default=1,
         nullable=False,
     )
-
-    # Награды.
 
     reward_currency: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
