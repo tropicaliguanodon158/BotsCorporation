@@ -1,10 +1,11 @@
+
 from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
     DateTime,
-    Integer,
+    ForeignKey,
     Numeric,
     String,
     Text,
@@ -24,19 +25,15 @@ class Wallet(Base):
 
     __tablename__ = "wallets"
 
-    # ------------------------------------------------------------------
-    # Identity
-    # ------------------------------------------------------------------
-
     user_id: Mapped[int] = mapped_column(
         BigInteger,
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
         primary_key=True,
         autoincrement=False,
     )
-
-    # ------------------------------------------------------------------
-    # Balances
-    # ------------------------------------------------------------------
 
     balance: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
@@ -49,10 +46,6 @@ class Wallet(Base):
         default=0,
         nullable=False,
     )
-
-    # ------------------------------------------------------------------
-    # Timestamps
-    # ------------------------------------------------------------------
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -70,23 +63,13 @@ class Wallet(Base):
 
 class Transaction(Base):
     """
-    Финансовая операция.
+    История финансовых операций.
 
-    Каждое изменение баланса должно оставлять запись здесь.
-
-    Это позволяет:
-        - видеть историю операций;
-        - расследовать спорные списания;
-        - делать статистику;
-        - откатывать операции;
-        - отслеживать действия администрации.
+    Каждое изменение currency-баланса должно
+    создавать Transaction.
     """
 
     __tablename__ = "transactions"
-
-    # ------------------------------------------------------------------
-    # Identity
-    # ------------------------------------------------------------------
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -96,13 +79,13 @@ class Transaction(Base):
 
     user_id: Mapped[int] = mapped_column(
         BigInteger,
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
-
-    # ------------------------------------------------------------------
-    # Transaction
-    # ------------------------------------------------------------------
 
     amount: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
@@ -119,10 +102,6 @@ class Transaction(Base):
         nullable=False,
     )
 
-    # ------------------------------------------------------------------
-    # Classification
-    # ------------------------------------------------------------------
-
     transaction_type: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
@@ -135,12 +114,12 @@ class Transaction(Base):
         index=True,
     )
 
-    # ------------------------------------------------------------------
-    # Optional references
-    # ------------------------------------------------------------------
-
     related_user_id: Mapped[int | None] = mapped_column(
         BigInteger,
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
         index=True,
     )
@@ -155,10 +134,6 @@ class Transaction(Base):
         Text,
         nullable=True,
     )
-
-    # ------------------------------------------------------------------
-    # Timestamp
-    # ------------------------------------------------------------------
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

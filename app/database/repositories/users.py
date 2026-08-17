@@ -8,19 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models.user import User
 
 
-# ============================================================================
-# USER REPOSITORY
-# ============================================================================
-
-
 class UserRepository:
     """
     Репозиторий пользователей Telegram.
 
-    Здесь находится только работа с таблицей users.
-
-    Бизнес-логика экономики, уровней, персонажей и модерации
-    здесь находиться не должна.
+    Только работа с таблицей users.
+    Бизнес-логика находится в service-слое.
     """
 
     def __init__(
@@ -37,13 +30,9 @@ class UserRepository:
         self,
         user_id: int,
     ) -> User | None:
-        """
-        Получает пользователя по Telegram ID.
-        """
-
         result = await self.session.execute(
             select(User).where(
-                User.id == user_id
+                User.id == user_id,
             )
         )
 
@@ -53,16 +42,12 @@ class UserRepository:
         self,
         user_ids: Sequence[int],
     ) -> list[User]:
-        """
-        Получает нескольких пользователей по ID.
-        """
-
         if not user_ids:
             return []
 
         result = await self.session.execute(
             select(User).where(
-                User.id.in_(user_ids)
+                User.id.in_(user_ids),
             )
         )
 
@@ -72,13 +57,9 @@ class UserRepository:
         self,
         user_id: int,
     ) -> bool:
-        """
-        Проверяет существование пользователя.
-        """
-
         result = await self.session.execute(
             select(User.id).where(
-                User.id == user_id
+                User.id == user_id,
             )
         )
 
@@ -95,12 +76,13 @@ class UserRepository:
         last_name: str | None = None,
         username: str | None = None,
     ) -> User:
-        """
-        Создаёт нового пользователя.
+        if user_id <= 0:
+            raise ValueError("Invalid Telegram user_id.")
 
-        Репозиторий НЕ делает commit.
-        Commit контролируется уровнем выше.
-        """
+        if not first_name:
+            raise ValueError(
+                "Telegram first_name cannot be empty."
+            )
 
         user = User(
             id=user_id,
@@ -129,24 +111,11 @@ class UserRepository:
         """
         Получает пользователя или создаёт его.
 
-        Возвращает:
-
-            (user, created)
-
-        Например:
-
-            user, created = await repo.get_or_create(...)
-
-        created == True
-            пользователь был создан.
-
-        created == False
-            пользователь уже существовал.
+        В рамках одного update/session обычной проверки достаточно.
+        Уникальный PK users.id дополнительно защищает БД от дубля.
         """
 
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is not None:
             return user, False
@@ -167,32 +136,30 @@ class UserRepository:
     async def update_profile(
         self,
         user_id: int,
-        first_name: str | None = None,
-        last_name: str | None = None,
-        username: str | None = None,
+        first_name: str,
+        last_name: str | None,
+        username: str | None,
     ) -> User | None:
         """
-        Обновляет Telegram-данные пользователя.
+        Полностью синхронизирует Telegram-профиль.
 
-        None означает:
-        соответствующее поле не изменять.
+        В отличие от старой реализации None здесь означает
+        реальное значение Telegram-профиля, а не «не менять».
         """
 
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
 
-        if first_name is not None:
-            user.first_name = first_name
+        if not first_name:
+            raise ValueError(
+                "Telegram first_name cannot be empty."
+            )
 
-        if last_name is not None:
-            user.last_name = last_name
-
-        if username is not None:
-            user.username = username
+        user.first_name = first_name
+        user.last_name = last_name
+        user.username = username
 
         await self.session.flush()
 
@@ -203,10 +170,6 @@ class UserRepository:
         user_id: int,
         is_active: bool,
     ) -> bool:
-        """
-        Включает или отключает пользователя.
-        """
-
         result = await self.session.execute(
             update(User)
             .where(User.id == user_id)
@@ -224,21 +187,10 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        """
-        Добавляет XP пользователю.
-
-        Само определение нового уровня будет
-        происходить в service-слое.
-        """
-
         if amount == 0:
-            return await self.get_by_id(
-                user_id
-            )
+            return await self.get_by_id(user_id)
 
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
@@ -254,23 +206,12 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        """
-        Устанавливает XP напрямую.
-
-        Нужен Founder Panel и административные операции.
-        """
-
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
 
-        user.xp = max(
-            0,
-            amount,
-        )
+        user.xp = max(0, amount)
 
         await self.session.flush()
 
@@ -285,21 +226,12 @@ class UserRepository:
         user_id: int,
         level: int,
     ) -> User | None:
-        """
-        Устанавливает уровень пользователя.
-        """
-
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
 
-        user.level = max(
-            1,
-            level,
-        )
+        user.level = max(1, level)
 
         await self.session.flush()
 
@@ -314,16 +246,7 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        """
-        Изменяет репутацию пользователя.
-
-        Репутация может быть как положительной,
-        так и отрицательной.
-        """
-
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
@@ -339,13 +262,7 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        """
-        Устанавливает репутацию напрямую.
-        """
-
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
@@ -365,18 +282,10 @@ class UserRepository:
         user_id: int,
         amount: int = 1,
     ) -> User | None:
-        """
-        Увеличивает общее количество сообщений.
-        """
-
         if amount <= 0:
-            return await self.get_by_id(
-                user_id
-            )
+            return await self.get_by_id(user_id)
 
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
@@ -392,22 +301,10 @@ class UserRepository:
         user_id: int,
         amount: int = 1,
     ) -> User | None:
-        """
-        Увеличивает количество сообщений за текущий
-        расчётный день.
-
-        Сброс суточного значения выполняется service-слоем,
-        потому что он знает timezone конкретного чата.
-        """
-
         if amount <= 0:
-            return await self.get_by_id(
-                user_id
-            )
+            return await self.get_by_id(user_id)
 
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
@@ -422,13 +319,7 @@ class UserRepository:
         self,
         user_id: int,
     ) -> User | None:
-        """
-        Сбрасывает дневной счётчик сообщений.
-        """
-
-        user = await self.get_by_id(
-            user_id
-        )
+        user = await self.get_by_id(user_id)
 
         if user is None:
             return None
@@ -447,21 +338,6 @@ class UserRepository:
         self,
         user_id: int,
     ) -> bool:
-        """
-        Деактивирует пользователя.
-
-        Мы не удаляем Telegram-пользователя физически,
-        поскольку на него могут ссылаться:
-
-            transactions
-            games
-            moderation actions
-            inventory
-            character
-            achievements
-            etc.
-        """
-
         return await self.set_active(
             user_id,
             False,
