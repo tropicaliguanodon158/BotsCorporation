@@ -35,6 +35,10 @@ from app.handlers.economy.shop import router as shop_router
 # FOUNDER PANEL
 # ============================================================================
 
+from app.handlers.founder.functional import (
+    router as founder_functional_router,
+)
+
 from app.handlers.founder.abilities import router as founder_abilities_router
 from app.handlers.founder.cases import router as founder_cases_router
 from app.handlers.founder.chats import router as founder_chats_router
@@ -47,7 +51,6 @@ from app.handlers.founder.races import router as founder_races_router
 from app.handlers.founder.ranks import router as founder_ranks_router
 from app.handlers.founder.shop import router as founder_shop_router
 from app.handlers.founder.users import router as founder_users_router
-
 # ============================================================================
 # GAMES
 # ============================================================================
@@ -204,9 +207,11 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(moderation_router)
     dp.include_router(moderation_filters_router)
 
-    # =========================================================================
+    # ============================================================================
     # FOUNDER PANEL
-    # =========================================================================
+    # ============================================================================
+
+    dp.include_router(founder_functional_router)
 
     dp.include_router(founder_panel_router)
     dp.include_router(founder_users_router)

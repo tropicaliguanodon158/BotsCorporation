@@ -29,8 +29,9 @@ class Race(Base):
 
     __tablename__ = "races"
 
+    # SQLite autoincrement корректно работает с INTEGER PRIMARY KEY.
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
@@ -119,8 +120,9 @@ class CharacterRank(Base):
 
     __tablename__ = "character_ranks"
 
+    # SQLite autoincrement корректно работает с INTEGER PRIMARY KEY.
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
@@ -244,8 +246,9 @@ class Ability(Base):
 
     __tablename__ = "abilities"
 
+    # SQLite autoincrement корректно работает с INTEGER PRIMARY KEY.
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
@@ -485,8 +488,9 @@ class CharacterAbility(Base):
 
     __tablename__ = "character_abilities"
 
+    # SQLite autoincrement корректно работает с INTEGER PRIMARY KEY.
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
@@ -529,5 +533,12 @@ class CharacterAbility(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
         nullable=False,
     )
