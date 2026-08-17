@@ -1,29 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject
+from aiogram.types import Message, TelegramObject
 from aiogram.types import User as TelegramUser
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models.user import User
+from app.database.repositories.economy import EconomyRepository
+from app.database.repositories.settings import SettingsRepository
+from app.database.repositories.tasks import TasksRepository
 from app.database.repositories.users import UserRepository
+from app.services.events import EventsService
+from app.services.rewards import RewardsService
 
 
 class UserMiddleware(BaseMiddleware):
     """
-    Middleware автоматической регистрации Telegram-пользователей.
+    Middleware автоматической регистрации пользователей.
 
-    Для каждого Telegram Update:
+    Дополнительно для обычных сообщений:
 
-        1. Получает Telegram User.
-        2. Получает/создаёт пользователя через UserRepository.
-        3. Обновляет актуальные Telegram-данные.
-        4. Передаёт SQLAlchemy User в handler через data["user"].
+        - фиксирует активность;
+        - обновляет счётчики сообщений;
+        - выдаёт награду;
+        - выдаёт XP.
 
-    Middleware не содержит SQL.
+    Все операции выполняются в рамках той же транзакции,
+    которую создаёт DatabaseMiddleware.
+
+    Никаких сообщений пользователю middleware не отправляет.
     """
 
     async def __call__(
@@ -55,11 +63,11 @@ class UserMiddleware(BaseMiddleware):
                 data,
             )
 
-        repository = UserRepository(
+        user_repository = UserRepository(
             session,
         )
 
-        user, created = await repository.get_or_create(
+        user, created = await user_repository.get_or_create(
             user_id=telegram_user.id,
             first_name=telegram_user.first_name,
             last_name=telegram_user.last_name,
@@ -67,7 +75,7 @@ class UserMiddleware(BaseMiddleware):
         )
 
         if not created:
-            user = await repository.update_profile(
+            user = await user_repository.update_profile(
                 user_id=telegram_user.id,
                 first_name=telegram_user.first_name,
                 last_name=telegram_user.last_name,
@@ -80,12 +88,12 @@ class UserMiddleware(BaseMiddleware):
                 )
 
             if not user.is_active:
-                await repository.set_active(
+                await user_repository.set_active(
                     user_id=telegram_user.id,
                     is_active=True,
                 )
 
-                user = await repository.get_by_id(
+                user = await user_repository.get_by_id(
                     telegram_user.id,
                 )
 
@@ -96,10 +104,60 @@ class UserMiddleware(BaseMiddleware):
 
         data["user"] = user
 
+        # ====================================================================
+        # MESSAGE ACTIVITY + REWARD
+        # ====================================================================
+
+        if isinstance(event, Message):
+            chat_id = event.chat.id
+
+            message_type = self._get_message_type(
+                event,
+            )
+
+            tasks_repository = TasksRepository(
+                session,
+            )
+
+            events_service = EventsService(
+                user_repository=user_repository,
+                tasks_repository=tasks_repository,
+            )
+
+            await events_service.on_message(
+                user_id=telegram_user.id,
+                message_type=message_type,
+                activity_date=datetime.now().date(),
+            )
+
+            rewards_service = RewardsService(
+                economy_repository=EconomyRepository(
+                    session,
+                ),
+                settings_repository=SettingsRepository(
+                    session,
+                ),
+                user_repository=user_repository,
+            )
+
+            await rewards_service.message_reward(
+                user_id=telegram_user.id,
+                chat_id=chat_id,
+                message_type=message_type,
+            )
+
+            data["user"] = await user_repository.get_by_id(
+                telegram_user.id,
+            )
+
         return await handler(
             event,
             data,
         )
+
+    # ========================================================================
+    # TELEGRAM USER
+    # ========================================================================
 
     @staticmethod
     def _get_telegram_user(
@@ -107,9 +165,6 @@ class UserMiddleware(BaseMiddleware):
     ) -> TelegramUser | None:
         """
         Извлекает Telegram User из события.
-
-        Если конкретный update не содержит пользователя,
-        middleware просто пропускает его дальше.
         """
 
         telegram_user = getattr(
@@ -125,3 +180,26 @@ class UserMiddleware(BaseMiddleware):
             return telegram_user
 
         return None
+
+    # ========================================================================
+    # MESSAGE TYPE
+    # ========================================================================
+
+    @staticmethod
+    def _get_message_type(
+        message: Message,
+    ) -> str:
+        """
+        Определяет тип сообщения для экономики и активности.
+        """
+
+        if message.photo:
+            return "photo"
+
+        if message.video:
+            return "video"
+
+        if message.text:
+            return "text"
+
+        return "other"
