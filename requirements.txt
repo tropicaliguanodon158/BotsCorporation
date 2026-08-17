@@ -1,7 +1,7 @@
-aiogram
-SQLAlchemy
-aiosqlite
-asyncpg
-pydantic
-pydantic-settings
-python-dotenv
+aiogram==3.22.0
+SQLAlchemy==2.0.43
+aiosqlite==0.21.0
+asyncpg==0.30.0
+pydantic==2.11.7
+pydantic-settings==2.10.1
+python-dotenv==1.1.1
