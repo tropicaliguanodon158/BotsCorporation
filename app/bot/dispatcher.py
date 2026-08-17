@@ -6,6 +6,9 @@ from app.handlers.common.help import router as help_router
 from app.handlers.common.profile import router as profile_router
 from app.handlers.common.start import router as start_router
 
+from app.handlers.character.character import router as character_router
+from app.handlers.character.inventory import router as character_inventory_router
+
 from app.handlers.economy.balance import router as balance_router
 from app.handlers.economy.bank import router as bank_router
 from app.handlers.economy.rewards import router as rewards_router
@@ -14,6 +17,13 @@ from app.handlers.economy.shop import router as shop_router
 from app.handlers.games.dice import router as dice_router
 from app.handlers.games.duel import router as duel_router
 from app.handlers.games.roulette import router as roulette_router
+
+from app.handlers.moderation.filters import (
+    router as moderation_filters_router,
+)
+from app.handlers.moderation.moderation import (
+    router as moderation_router,
+)
 
 from app.middlewares.database import DatabaseMiddleware
 from app.middlewares.logging import LoggingMiddleware
@@ -48,6 +58,13 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(profile_router)
 
     # ========================================================================
+    # CHARACTER
+    # ========================================================================
+
+    dp.include_router(character_router)
+    dp.include_router(character_inventory_router)
+
+    # ========================================================================
     # ECONOMY
     # ========================================================================
 
@@ -63,5 +80,12 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(dice_router)
     dp.include_router(roulette_router)
     dp.include_router(duel_router)
+
+    # ========================================================================
+    # MODERATION
+    # ========================================================================
+
+    dp.include_router(moderation_router)
+    dp.include_router(moderation_filters_router)
 
     return dp
