@@ -7,7 +7,9 @@ from app.handlers.common.profile import router as profile_router
 from app.handlers.common.start import router as start_router
 
 from app.handlers.economy.balance import router as balance_router
+from app.handlers.economy.bank import router as bank_router
 from app.handlers.economy.rewards import router as rewards_router
+from app.handlers.economy.shop import router as shop_router
 
 from app.handlers.games.dice import router as dice_router
 from app.handlers.games.duel import router as duel_router
@@ -51,6 +53,8 @@ def create_dispatcher() -> Dispatcher:
 
     dp.include_router(balance_router)
     dp.include_router(rewards_router)
+    dp.include_router(bank_router)
+    dp.include_router(shop_router)
 
     # ========================================================================
     # GAMES

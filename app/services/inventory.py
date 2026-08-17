@@ -9,6 +9,7 @@ from app.database.models.inventory import (
     InventoryItem,
     Item,
 )
+from app.database.repositories.economy import EconomyRepository
 from app.database.repositories.inventory import InventoryRepository
 
 
@@ -31,8 +32,10 @@ class InventoryService:
     def __init__(
         self,
         repository: InventoryRepository,
+        economy_repository: EconomyRepository | None = None,
     ) -> None:
         self.repository = repository
+        self.economy = economy_repository
 
     # ========================================================================
     # ITEMS
@@ -117,14 +120,10 @@ class InventoryService:
         item = await self.repository.get_item(item_id)
 
         if item is None:
-            raise ValueError(
-                "Item does not exist."
-            )
+            raise ValueError("Item does not exist.")
 
         if not item.is_active:
-            raise ValueError(
-                "Item is inactive."
-            )
+            raise ValueError("Item is inactive.")
 
         custom_data_json = None
 
@@ -170,19 +169,6 @@ class InventoryService:
     # SHOP
     # ========================================================================
 
-    async def get_item_price(
-        self,
-        item_id: int,
-    ) -> Decimal:
-        item = await self.repository.get_item(item_id)
-
-        if item is None:
-            raise ValueError(
-                "Item does not exist."
-            )
-
-        return item.price
-
     async def calculate_buy_price(
         self,
         *,
@@ -197,14 +183,13 @@ class InventoryService:
         item = await self.repository.get_item(item_id)
 
         if item is None:
-            raise ValueError(
-                "Item does not exist."
-            )
+            raise ValueError("Item does not exist.")
 
         if not item.is_active:
-            raise ValueError(
-                "Item is inactive."
-            )
+            raise ValueError("Item is inactive.")
+
+        if item.price < 0:
+            raise ValueError("Item has invalid price.")
 
         return (
             item.price * quantity
@@ -232,9 +217,7 @@ class InventoryService:
         item = await self.repository.get_item(item_id)
 
         if item is None:
-            raise ValueError(
-                "Item does not exist."
-            )
+            raise ValueError("Item does not exist.")
 
         if not item.is_sellable:
             raise ValueError(
@@ -244,6 +227,142 @@ class InventoryService:
         return (
             item.price * quantity * rate
         ).quantize(Decimal("0.01"))
+
+    async def buy_item(
+        self,
+        *,
+        user_id: int,
+        item_id: int,
+        quantity: int = 1,
+    ) -> tuple[Item, Decimal]:
+        """
+        Купить предмет.
+
+        Списание денег и выдача предмета выполняются
+        в рамках одной транзакции middleware.
+        """
+
+        if self.economy is None:
+            raise RuntimeError(
+                "EconomyRepository is required for shop operations."
+            )
+
+        if user_id <= 0:
+            raise ValueError("Invalid user_id.")
+
+        if quantity <= 0:
+            raise ValueError(
+                "Quantity must be greater than zero."
+            )
+
+        item = await self.repository.get_item(item_id)
+
+        if item is None:
+            raise ValueError("Item does not exist.")
+
+        if not item.is_active:
+            raise ValueError("Item is inactive.")
+
+        total_price = await self.calculate_buy_price(
+            item_id=item_id,
+            quantity=quantity,
+        )
+
+        transaction = await self.economy.remove_balance(
+            user_id=user_id,
+            amount=total_price,
+            transaction_type="shop_purchase",
+            source="shop",
+            reference_id=f"item:{item_id}",
+        )
+
+        if transaction is None:
+            raise ValueError(
+                "Insufficient balance."
+            )
+
+        await self.repository.add_item(
+            user_id=user_id,
+            item_id=item_id,
+            quantity=quantity,
+        )
+
+        return item, total_price
+
+    async def sell_item(
+        self,
+        *,
+        user_id: int,
+        item_id: int,
+        quantity: int = 1,
+        sell_rate: Decimal | int | float | str = Decimal("0.50"),
+    ) -> tuple[Item, Decimal]:
+        """
+        Продать предмет.
+
+        Сначала проверяется наличие предмета.
+        После успешного списания предмета деньги начисляются
+        в рамках той же транзакции.
+        """
+
+        if self.economy is None:
+            raise RuntimeError(
+                "EconomyRepository is required for shop operations."
+            )
+
+        if user_id <= 0:
+            raise ValueError("Invalid user_id.")
+
+        if quantity <= 0:
+            raise ValueError(
+                "Quantity must be greater than zero."
+            )
+
+        item = await self.repository.get_item(item_id)
+
+        if item is None:
+            raise ValueError("Item does not exist.")
+
+        if not item.is_sellable:
+            raise ValueError(
+                "This item cannot be sold."
+            )
+
+        if not await self.repository.has_item(
+            user_id=user_id,
+            item_id=item_id,
+            quantity=quantity,
+        ):
+            raise ValueError(
+                "You do not have enough of this item."
+            )
+
+        total_price = await self.calculate_sell_price(
+            item_id=item_id,
+            quantity=quantity,
+            sell_rate=sell_rate,
+        )
+
+        success = await self.repository.remove_item(
+            user_id=user_id,
+            item_id=item_id,
+            quantity=quantity,
+        )
+
+        if not success:
+            raise RuntimeError(
+                "Inventory changed unexpectedly."
+            )
+
+        await self.economy.add_balance(
+            user_id=user_id,
+            amount=total_price,
+            transaction_type="shop_sale",
+            source="shop",
+            reference_id=f"item:{item_id}",
+        )
+
+        return item, total_price
 
     # ========================================================================
     # USE
@@ -264,14 +383,10 @@ class InventoryService:
         item = await self.repository.get_item(item_id)
 
         if item is None:
-            raise ValueError(
-                "Item does not exist."
-            )
+            raise ValueError("Item does not exist.")
 
         if not item.is_active:
-            raise ValueError(
-                "Item is inactive."
-            )
+            raise ValueError("Item is inactive.")
 
         if not await self.repository.has_item(
             user_id=user_id,
@@ -314,14 +429,10 @@ class InventoryService:
         item = await self.repository.get_item(item_id)
 
         if item is None:
-            raise ValueError(
-                "Item does not exist."
-            )
+            raise ValueError("Item does not exist.")
 
         if not item.is_active:
-            raise ValueError(
-                "Item is inactive."
-            )
+            raise ValueError("Item is inactive.")
 
         if item.item_type not in {
             "weapon",
