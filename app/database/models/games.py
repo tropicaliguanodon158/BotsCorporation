@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from decimal import Decimal
 
@@ -5,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Integer,
     Numeric,
     String,
     Text,
@@ -37,7 +40,7 @@ class Game(Base):
     __tablename__ = "games"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
@@ -133,13 +136,13 @@ class GamePlayer(Base):
     __tablename__ = "game_players"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
 
     game_id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         ForeignKey(
             "games.id",
             ondelete="CASCADE",
@@ -214,13 +217,13 @@ class GameBet(Base):
     __tablename__ = "game_bets"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
 
     game_id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         ForeignKey(
             "games.id",
             ondelete="CASCADE",

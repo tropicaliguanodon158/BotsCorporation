@@ -42,6 +42,59 @@ class EconomyRepository:
     ) -> None:
         self.session = session
 
+    @staticmethod
+    def _validate_existing_transaction(
+        transaction: Transaction,
+        *,
+        amount: Decimal,
+        transaction_type: str,
+        source: str,
+        related_user_id: int | None,
+    ) -> None:
+        """
+        Проверяет, что повторная операция с тем же
+        reference_id действительно является той же
+        самой бизнес-операцией.
+
+        Это защищает от ситуации:
+
+            reference_id = reward:123
+            первый вызов = 10
+            второй вызов = 1000
+
+        В таком случае нельзя молча вернуть старую
+        транзакцию.
+        """
+
+        expected_amount = amount
+
+        if transaction.amount != expected_amount:
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "amount does not match existing transaction."
+            )
+
+        if transaction.transaction_type != transaction_type:
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "transaction_type does not match."
+            )
+
+        if transaction.source != source:
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "source does not match."
+            )
+
+        if (
+            transaction.related_user_id
+            != related_user_id
+        ):
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "related_user_id does not match."
+            )
+
     # ========================================================================
     # INTERNAL
     # ========================================================================
@@ -103,6 +156,49 @@ class EconomyRepository:
         )
 
         return result.scalar_one_or_none()
+
+    @staticmethod
+    def _validate_existing_transaction(
+        transaction: Transaction,
+        *,
+        expected_amount: Decimal,
+        transaction_type: str,
+        source: str,
+        related_user_id: int | None,
+    ) -> None:
+        """
+        Проверяет повторную финансовую операцию.
+
+        Один reference_id нельзя использовать для
+        другой операции с другими параметрами.
+        """
+
+        if transaction.amount != expected_amount:
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "amount does not match existing transaction."
+            )
+
+        if transaction.transaction_type != transaction_type:
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "transaction_type does not match."
+            )
+
+        if transaction.source != source:
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "source does not match."
+            )
+
+        if (
+            transaction.related_user_id
+            != related_user_id
+        ):
+            raise RuntimeError(
+                "Transaction reference collision: "
+                "related_user_id does not match."
+            )
 
     # ========================================================================
     # WALLET

@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
@@ -6,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Integer,
     Numeric,
     String,
     Text,
@@ -21,6 +23,9 @@ class Wallet(Base):
     Кошелёк пользователя.
 
     Один пользователь = один кошелёк.
+
+    user_id является Telegram ID, поэтому здесь используется
+    BigInteger и autoincrement отключён.
     """
 
     __tablename__ = "wallets"
@@ -65,14 +70,21 @@ class Transaction(Base):
     """
     История финансовых операций.
 
-    Каждое изменение currency-баланса должно
-    создавать Transaction.
+    Каждое изменение currency-баланса должно создавать
+    Transaction.
+
+    ВАЖНО:
+
+    id использует Integer, а не BigInteger.
+
+    SQLite поддерживает автоматическое увеличение PK
+    только для INTEGER PRIMARY KEY.
     """
 
     __tablename__ = "transactions"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )

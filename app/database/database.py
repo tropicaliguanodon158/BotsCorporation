@@ -1,9 +1,9 @@
-
 from __future__ import annotations
 
-from sqlalchemy import event
-from sqlalchemy.engine import Engine
+from sqlalchemy import event, inspect, text
+
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -13,16 +13,8 @@ from app.config.settings import settings
 from app.database.models import Base
 
 
-# ============================================================================
-# DATABASE URL
-# ============================================================================
-
 DATABASE_URL = settings.DATABASE_URL
 
-
-# ============================================================================
-# ENGINE
-# ============================================================================
 
 _engine_kwargs: dict = {
     "echo": settings.DATABASE_ECHO,
@@ -30,15 +22,6 @@ _engine_kwargs: dict = {
 }
 
 
-# SQLite не нуждается в большом connection pool.
-#
-# Для локального запуска на ноутбуке:
-#     - минимальное потребление памяти;
-#     - меньше открытых соединений;
-#     - WAL для лучшей конкурентности чтения/записи;
-#     - timeout вместо мгновенного "database is locked".
-#
-# Для PostgreSQL используется небольшой pool.
 if DATABASE_URL.startswith("sqlite"):
     _engine_kwargs.update(
         {
@@ -48,7 +31,6 @@ if DATABASE_URL.startswith("sqlite"):
             },
         }
     )
-
 else:
     _engine_kwargs.update(
         {
@@ -66,11 +48,6 @@ engine = create_async_engine(
 )
 
 
-# ============================================================================
-# SQLITE OPTIMIZATION
-# ============================================================================
-
-
 if DATABASE_URL.startswith("sqlite"):
 
     @event.listens_for(
@@ -81,19 +58,6 @@ if DATABASE_URL.startswith("sqlite"):
         dbapi_connection,
         connection_record,
     ) -> None:
-        """
-        Настройки SQLite для длительной работы бота.
-
-        WAL:
-            позволяет чтениям продолжаться во время записи.
-
-        NORMAL:
-            хороший баланс между безопасностью и скоростью.
-
-        foreign_keys:
-            обязательно включаем каскадные FK.
-        """
-
         cursor = dbapi_connection.cursor()
 
         cursor.execute(
@@ -115,11 +79,6 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.close()
 
 
-# ============================================================================
-# SESSION
-# ============================================================================
-
-
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
@@ -128,20 +87,82 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-# ============================================================================
-# DATABASE INITIALIZATION
-# ============================================================================
+async def _ensure_sqlite_schema(
+    connection: AsyncConnection,
+) -> None:
+    """
+    Небольшой встроенный schema upgrade для локальной SQLite БД.
+
+    Используется только для безопасного перехода
+    существующей development-базы на текущую схему.
+
+    Полноценные миграции в дальнейшем лучше перевести
+    на Alembic.
+    """
+
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+
+    def inspect_schema(sync_connection) -> None:
+        inspector = inspect(sync_connection)
+
+        if "transactions" not in inspector.get_table_names():
+            return
+
+        unique_constraints = (
+            inspector.get_unique_constraints(
+                "transactions"
+            )
+        )
+
+        existing_names = {
+            constraint.get("name")
+            for constraint in unique_constraints
+        }
+
+        target_name = (
+            "uq_transactions_user_reference"
+        )
+
+        if target_name in existing_names:
+            return
+
+        columns = {
+            column["name"]
+            for column in inspector.get_columns(
+                "transactions"
+            )
+        }
+
+        if {
+            "user_id",
+            "reference_id",
+        } - columns:
+            return
+
+        sync_connection.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_transactions_user_reference
+                ON transactions (
+                    user_id,
+                    reference_id
+                )
+                WHERE reference_id IS NOT NULL
+                """
+            )
+        )
+
+    await connection.run_sync(
+        inspect_schema
+    )
 
 
 async def init_database() -> None:
     """
-    Инициализирует базу данных.
-
-    На этапе разработки create_all используется для
-    создания отсутствующих таблиц.
-
-    В production после стабилизации схемы необходимо
-    перейти на Alembic migrations.
+    Создаёт отсутствующие таблицы и выполняет
+    небольшие совместимые schema upgrades.
     """
 
     async with engine.begin() as connection:
@@ -149,10 +170,9 @@ async def init_database() -> None:
             Base.metadata.create_all
         )
 
-
-# ============================================================================
-# DATABASE SHUTDOWN
-# ============================================================================
+        await _ensure_sqlite_schema(
+            connection
+        )
 
 
 async def close_database() -> None:
@@ -163,21 +183,12 @@ async def close_database() -> None:
     await engine.dispose()
 
 
-# ============================================================================
-# SESSION HELPER
-# ============================================================================
-
-
 def get_session() -> AsyncSession:
     """
-    Создаёт новую AsyncSession.
+    Создаёт отдельную AsyncSession.
 
-    В обычных Telegram handlers рекомендуется
-    использовать session, предоставленную
-    DatabaseMiddleware.
-
-    Этот helper оставлен для фоновых задач
-    и отдельных сервисных операций.
+    Для обычных handlers следует использовать
+    session из DatabaseMiddleware.
     """
 
     return AsyncSessionLocal()
