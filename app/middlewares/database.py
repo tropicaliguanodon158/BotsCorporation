@@ -7,6 +7,8 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.database.database import AsyncSessionLocal
+
 
 class DatabaseMiddleware(BaseMiddleware):
     """
@@ -17,24 +19,16 @@ class DatabaseMiddleware(BaseMiddleware):
         1. создаётся новая AsyncSession;
         2. session передаётся в handler;
         3. handler выполняется;
-        4. при успешном выполнении изменения фиксируются;
-        5. при исключении выполняется rollback;
+        4. при успехе выполняется commit;
+        5. при ошибке выполняется rollback;
         6. session закрывается.
 
-    В handler мы сможем получать:
-
-        async def handler(message, session):
-            ...
-
-    или:
-
-        async def handler(callback, session):
-            ...
+    Репозитории и сервисы получают эту же session.
     """
 
     def __init__(
         self,
-        session_factory: async_sessionmaker[AsyncSession],
+        session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal,
     ) -> None:
         self.session_factory = session_factory
 
@@ -48,14 +42,17 @@ class DatabaseMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         """
-        Создаёт БД-сессию и передаёт её в handler.
+        Создаёт транзакцию на время обработки одного update.
         """
 
         async with self.session_factory() as session:
             data["session"] = session
 
             try:
-                result = await handler(event, data)
+                result = await handler(
+                    event,
+                    data,
+                )
 
                 await session.commit()
 

@@ -1,14 +1,40 @@
+from __future__ import annotations
+
 from aiogram import Dispatcher
+
+from app.handlers.common.start import router as start_router
+from app.middlewares.database import DatabaseMiddleware
 
 
 def create_dispatcher() -> Dispatcher:
     """
-    Создаёт и возвращает главный Dispatcher приложения.
+    Создаёт главный Dispatcher приложения.
 
-    Dispatcher отвечает за обработку входящих обновлений
-    от Telegram и передачу их соответствующим роутерам.
+    Здесь собираются:
+
+        - middleware;
+        - пользовательские роутеры;
+        - обработчики Telegram updates.
+
+    Бизнес-логика здесь отсутствует.
     """
 
     dp = Dispatcher()
+
+    # ========================================================================
+    # MIDDLEWARE
+    # ========================================================================
+
+    dp.update.outer_middleware(
+        DatabaseMiddleware(),
+    )
+
+    # ========================================================================
+    # ROUTERS
+    # ========================================================================
+
+    dp.include_router(
+        start_router,
+    )
 
     return dp
