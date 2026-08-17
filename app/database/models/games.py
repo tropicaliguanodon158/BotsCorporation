@@ -5,10 +5,10 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
-    Integer,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,7 +25,7 @@ class Game(Base):
     """
     Игровая сессия.
 
-    Примеры game_type:
+    Типы игр:
 
         roulette
         blackjack
@@ -55,35 +55,31 @@ class Game(Base):
         index=True,
     )
 
-    # Возможные состояния:
-    #
-    # created
-    # waiting
-    # active
-    # finished
-    # cancelled
-
     chat_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
         index=True,
     )
 
-    creator_id: Mapped[int] = mapped_column(
+    creator_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
         index=True,
     )
 
     winner_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
         index=True,
     )
-
-    # Общая сумма ставок/банка игры.
 
     pot: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
@@ -91,19 +87,15 @@ class Game(Base):
         nullable=False,
     )
 
-    # Произвольные данные состояния игры.
-
     game_data: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
     )
 
-    # Уникальный идентификатор раунда,
-    # который можно показывать в логах.
-
-    round_id: Mapped[str | None] = mapped_column(
+    round_id: Mapped[str] = mapped_column(
         String(100),
-        nullable=True,
+        nullable=False,
+        unique=True,
         index=True,
     )
 
@@ -133,6 +125,9 @@ class Game(Base):
 class GamePlayer(Base):
     """
     Участник игровой сессии.
+
+    Один пользователь может находиться
+    в конкретной игре только один раз.
     """
 
     __tablename__ = "game_players"
@@ -145,19 +140,23 @@ class GamePlayer(Base):
 
     game_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("games.id", ondelete="CASCADE"),
+        ForeignKey(
+            "games.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
     user_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("users.id", ondelete="CASCADE"),
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
-
-    # Ставка игрока.
 
     bet: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
@@ -165,30 +164,16 @@ class GamePlayer(Base):
         nullable=False,
     )
 
-    # Сколько игрок получил после завершения игры.
-
     payout: Mapped[Decimal] = mapped_column(
         Numeric(20, 2),
         default=Decimal("0.00"),
         nullable=False,
     )
 
-    # Результат игрока.
-
     result: Mapped[str | None] = mapped_column(
         String(50),
         nullable=True,
     )
-
-    # Возможные значения:
-    #
-    # winner
-    # loser
-    # draw
-    # bust
-    # cancelled
-
-    # Индивидуальное состояние игрока.
 
     player_data: Mapped[str | None] = mapped_column(
         Text,
@@ -201,6 +186,14 @@ class GamePlayer(Base):
         nullable=False,
     )
 
+    __table_args__ = (
+        UniqueConstraint(
+            "game_id",
+            "user_id",
+            name="uq_game_player",
+        ),
+    )
+
 
 # ============================================================================
 # GAME BETS
@@ -209,9 +202,9 @@ class GamePlayer(Base):
 
 class GameBet(Base):
     """
-    Отдельная ставка в игре.
+    Отдельная ставка.
 
-    Используется для детального финансового аудита.
+    Используется для финансового аудита.
     """
 
     __tablename__ = "game_bets"
@@ -224,14 +217,20 @@ class GameBet(Base):
 
     game_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("games.id", ondelete="CASCADE"),
+        ForeignKey(
+            "games.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
     user_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("users.id", ondelete="CASCADE"),
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -245,17 +244,6 @@ class GameBet(Base):
         String(50),
         nullable=False,
     )
-
-    # Например:
-    #
-    # red
-    # black
-    # number
-    # odd
-    # even
-    # blackjack
-    # duel
-    # dice
 
     selection: Mapped[str | None] = mapped_column(
         String(100),

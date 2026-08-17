@@ -52,6 +52,7 @@ class GamesRepository:
     # GAMES
     # ========================================================================
 
+
     async def create_game(
         self,
         *,
@@ -65,36 +66,43 @@ class GamesRepository:
     ) -> Game:
         """
         Создать игровую сессию.
-
-        Если round_id не передан, генерируется автоматически.
         """
-
+    
+        game_type = game_type.strip()
+    
+        if not game_type:
+            raise ValueError(
+                "game_type cannot be empty."
+            )
+    
         pot = Decimal(str(pot))
-
+    
         if pot < 0:
             raise ValueError(
                 "Game pot cannot be negative."
             )
-
-        if not game_type.strip():
-            raise ValueError(
-                "game_type cannot be empty."
-            )
-
+    
         if round_id is None:
             round_id = uuid4().hex
-
+        else:
+            round_id = round_id.strip()
+    
+            if not round_id:
+                raise ValueError(
+                    "round_id cannot be empty."
+                )
+    
         game_data_json: str | None = None
-
+    
         if game_data is not None:
             game_data_json = json.dumps(
                 game_data,
                 ensure_ascii=False,
                 default=str,
             )
-
+    
         game = Game(
-            game_type=game_type.strip(),
+            game_type=game_type,
             status=status,
             chat_id=chat_id,
             creator_id=creator_id,
@@ -102,12 +110,13 @@ class GamesRepository:
             game_data=game_data_json,
             round_id=round_id,
         )
-
+    
         self.session.add(game)
-
+    
         await self.session.flush()
-
+    
         return game
+
 
     async def get_game(
         self,
