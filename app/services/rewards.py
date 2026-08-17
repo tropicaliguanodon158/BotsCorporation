@@ -1,4 +1,4 @@
-```python
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -663,4 +663,3 @@ class RewardsService:
             rewarded=rewarded,
             reason=None if rewarded else "empty_reward",
         )
-```

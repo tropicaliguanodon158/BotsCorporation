@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
@@ -19,24 +20,17 @@ from app.services.rewards import RewardsService
 
 class UserMiddleware(BaseMiddleware):
     """
-    Middleware автоматической регистрации пользователей.
+    Глобальный middleware пользователя.
 
-    Для каждого пользователя:
-        - создаёт/обновляет пользователя;
-        - для обычных сообщений фиксирует активность;
-        - выдаёт награду за сообщение.
+    На каждом update:
 
-    ВАЖНО:
+        1. гарантирует наличие пользователя;
+        2. гарантирует наличие чата;
+        3. обновляет профиль;
+        4. для обычных сообщений фиксирует активность;
+        5. выдаёт экономическую награду.
 
-        XP за сообщение выдаётся RewardsService.
-
-        EventsService отвечает за:
-            - счётчики сообщений;
-            - UserDailyActivity.
-
-        Commands (/start, /daily, /hourly и т.д.)
-        НЕ считаются обычной активностью и НЕ получают
-        автоматическую награду.
+    Команды не считаются обычными сообщениями.
     """
 
     async def __call__(
@@ -48,29 +42,23 @@ class UserMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        session: AsyncSession | None = data.get(
-            "session",
-        )
+        session: AsyncSession | None = data.get("session")
 
         if session is None:
             raise RuntimeError(
-                "UserMiddleware требует "
-                "DatabaseMiddleware перед ним."
+                "UserMiddleware requires DatabaseMiddleware."
             )
 
-        telegram_user = self._get_telegram_user(
-            event,
-        )
+        telegram_user = self._get_telegram_user(event)
 
         if telegram_user is None:
-            return await handler(
-                event,
-                data,
-            )
+            return await handler(event, data)
 
-        user_repository = UserRepository(
-            session,
-        )
+        user_repository = UserRepository(session)
+
+        # ====================================================================
+        # USER
+        # ====================================================================
 
         user, created = await user_repository.get_or_create(
             user_id=telegram_user.id,
@@ -110,42 +98,45 @@ class UserMiddleware(BaseMiddleware):
         data["user"] = user
 
         # ====================================================================
-        # MESSAGE ACTIVITY + REWARD
+        # CHAT
         # ====================================================================
 
         if isinstance(event, Message):
+            chat = event.chat
 
-            # ----------------------------------------------------------------
-            # Команды не являются обычной активностью.
-            # ----------------------------------------------------------------
+            settings_repository = SettingsRepository(session)
 
-            if self._is_command(event):
-                return await handler(
-                    event,
-                    data,
-                )
+            db_chat = await settings_repository.get_or_create_chat(
+                chat_id=chat.id,
+                title=chat.title,
+                username=chat.username,
+                chat_type=chat.type,
+            )
 
+            data["chat"] = db_chat
+
+        # ====================================================================
+        # COMMANDS
+        # ====================================================================
+
+        if isinstance(event, Message) and self._is_command(event):
+            return await handler(event, data)
+
+        # ====================================================================
+        # MESSAGE ACTIVITY
+        # ====================================================================
+
+        if isinstance(event, Message):
             chat_id = event.chat.id
 
-            message_type = self._get_message_type(
-                event,
-            )
+            message_type = self._get_message_type(event)
 
-            tasks_repository = TasksRepository(
-                session,
-            )
+            tasks_repository = TasksRepository(session)
 
             events_service = EventsService(
                 user_repository=user_repository,
                 tasks_repository=tasks_repository,
             )
-
-            # ----------------------------------------------------------------
-            # Счётчики и дневная активность.
-            #
-            # XP здесь НЕ выдаём.
-            # XP за сообщение выдаёт RewardsService.
-            # ----------------------------------------------------------------
 
             await events_service.on_message(
                 user_id=telegram_user.id,
@@ -154,17 +145,13 @@ class UserMiddleware(BaseMiddleware):
                 xp=0,
             )
 
-            # ----------------------------------------------------------------
-            # Экономическая награда.
-            # ----------------------------------------------------------------
+            # ================================================================
+            # REWARD
+            # ================================================================
 
             rewards_service = RewardsService(
-                economy_repository=EconomyRepository(
-                    session,
-                ),
-                settings_repository=SettingsRepository(
-                    session,
-                ),
+                economy_repository=EconomyRepository(session),
+                settings_repository=SettingsRepository(session),
                 user_repository=user_repository,
             )
 
@@ -174,14 +161,14 @@ class UserMiddleware(BaseMiddleware):
                 message_type=message_type,
             )
 
-            data["user"] = await user_repository.get_by_id(
+            updated_user = await user_repository.get_by_id(
                 telegram_user.id,
             )
 
-        return await handler(
-            event,
-            data,
-        )
+            if updated_user is not None:
+                data["user"] = updated_user
+
+        return await handler(event, data)
 
     # ========================================================================
     # TELEGRAM USER
@@ -191,10 +178,6 @@ class UserMiddleware(BaseMiddleware):
     def _get_telegram_user(
         event: TelegramObject,
     ) -> TelegramUser | None:
-        """
-        Извлечь Telegram User из события.
-        """
-
         telegram_user = getattr(
             event,
             "from_user",
@@ -217,18 +200,6 @@ class UserMiddleware(BaseMiddleware):
     def _is_command(
         message: Message,
     ) -> bool:
-        """
-        Определить, является ли сообщение командой.
-
-        Учитываем как:
-            /start
-            /daily
-            /balance
-
-        так и:
-            /start@bot_username
-        """
-
         if not message.text:
             return False
 
@@ -249,10 +220,6 @@ class UserMiddleware(BaseMiddleware):
     def _get_message_type(
         message: Message,
     ) -> str:
-        """
-        Определяет тип сообщения для экономики и активности.
-        """
-
         if message.photo:
             return "photo"
 
