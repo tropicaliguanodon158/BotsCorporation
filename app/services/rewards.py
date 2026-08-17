@@ -28,22 +28,17 @@ class RewardsService:
     Единый сервис наград.
 
     Отвечает за:
-        - награду за сообщения;
+        - награды за сообщения;
         - фото;
         - видео;
         - hourly;
         - daily;
-        - произвольные награды;
-        - валюту;
-        - гемы;
-        - XP.
+        - произвольные награды.
 
-    commit / rollback выполняются DatabaseMiddleware.
+    ВАЖНО:
+        Сервис не выполняет commit().
+        Транзакцией управляет внешний слой приложения.
     """
-
-    # ========================================================================
-    # DEFAULTS
-    # ========================================================================
 
     DEFAULT_MESSAGE_REWARD = Decimal("1.00")
     DEFAULT_PHOTO_REWARD = Decimal("3.00")
@@ -67,10 +62,6 @@ class RewardsService:
     DEFAULT_DAILY_XP = 50
     DEFAULT_DAILY_GEMS = 1
 
-    # ========================================================================
-    # SETTINGS KEYS
-    # ========================================================================
-
     SETTING_MESSAGE_REWARD = "rewards.message.currency"
     SETTING_MESSAGE_XP = "rewards.message.xp"
     SETTING_MESSAGE_GEMS = "rewards.message.gems"
@@ -92,10 +83,6 @@ class RewardsService:
     SETTING_DAILY_XP = "rewards.daily.xp"
     SETTING_DAILY_GEMS = "rewards.daily.gems"
 
-    # ========================================================================
-    # INIT
-    # ========================================================================
-
     def __init__(
         self,
         *,
@@ -116,21 +103,16 @@ class RewardsService:
         if user_id <= 0:
             raise ValueError("Invalid user_id.")
 
-    async def _get_setting(
-        self,
-        *,
-        chat_id: int | None,
-        key: str,
-        default: Any,
-    ) -> Any:
-        if chat_id is None:
-            return default
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now()
 
-        return await self.settings.get(
-            chat_id=chat_id,
-            key=key,
-            default=default,
-        )
+    @staticmethod
+    def _normalize_datetime(value: datetime) -> datetime:
+        if value.tzinfo is not None:
+            return value.replace(tzinfo=None)
+
+        return value
 
     @staticmethod
     def _decimal(
@@ -163,24 +145,21 @@ class RewardsService:
         except (TypeError, ValueError):
             return default
 
-    @staticmethod
-    def _now() -> datetime:
-        return datetime.now()
+    async def _get_setting(
+        self,
+        *,
+        chat_id: int | None,
+        key: str,
+        default: Any,
+    ) -> Any:
+        if chat_id is None:
+            return default
 
-    @staticmethod
-    def _normalize_datetime(value: datetime) -> datetime:
-        """
-        SQLite может вернуть naive datetime,
-        PostgreSQL — timezone-aware.
-
-        Приводим оба варианта к naive UTC-подобному
-        сравнению без изменения самого значения.
-        """
-
-        if value.tzinfo is not None:
-            return value.replace(tzinfo=None)
-
-        return value
+        return await self.settings.get(
+            chat_id=chat_id,
+            key=key,
+            default=default,
+        )
 
     async def _has_recent_transaction(
         self,
@@ -190,10 +169,11 @@ class RewardsService:
         since: datetime,
     ) -> bool:
         """
-        Проверить, была ли недавно транзакция указанного типа.
+        Проверяет финансовую историю пользователя.
 
-        Используем финансовую историю как источник истины.
-        Отдельная таблица cooldown для этого не нужна.
+        Это защита от повторной выдачи после уже сохранённой
+        транзакции. Внешняя транзакция БД всё равно должна
+        использоваться для полной защиты от race condition.
         """
 
         transactions = await self.economy.get_transactions(
@@ -226,9 +206,9 @@ class RewardsService:
         now = self._now()
 
         start_of_day = datetime(
-            year=now.year,
-            month=now.month,
-            day=now.day,
+            now.year,
+            now.month,
+            now.day,
         )
 
         return await self._has_recent_transaction(
@@ -257,14 +237,11 @@ class RewardsService:
         if cooldown_seconds <= 0:
             return False
 
-        now = self._now()
-
         return await self._has_recent_transaction(
             user_id=user_id,
             source="message",
-            since=now - timedelta(
-                seconds=cooldown_seconds,
-            ),
+            since=self._now()
+            - timedelta(seconds=cooldown_seconds),
         )
 
     # ========================================================================
@@ -280,9 +257,7 @@ class RewardsService:
     ) -> RewardResult:
         self._validate_user_id(user_id)
 
-        message_type = (
-            message_type.strip().lower()
-        )
+        message_type = message_type.strip().lower()
 
         if message_type == "photo":
             return await self.photo_reward(
@@ -296,10 +271,7 @@ class RewardsService:
                 chat_id=chat_id,
             )
 
-        if message_type not in {
-            "text",
-            "other",
-        }:
+        if message_type not in {"text", "other"}:
             message_type = "text"
 
         cooldown = await self._get_setting(
@@ -596,28 +568,20 @@ class RewardsService:
         self._validate_user_id(user_id)
 
         if not source or not source.strip():
-            raise ValueError(
-                "Reward source cannot be empty."
-            )
+            raise ValueError("Reward source cannot be empty.")
 
         currency = self._decimal(currency)
         xp = self._int(xp)
         gems = self._int(gems)
 
         if currency < 0:
-            raise ValueError(
-                "Currency reward cannot be negative."
-            )
+            raise ValueError("Currency reward cannot be negative.")
 
         if xp < 0:
-            raise ValueError(
-                "XP reward cannot be negative."
-            )
+            raise ValueError("XP reward cannot be negative.")
 
         if gems < 0:
-            raise ValueError(
-                "Gem reward cannot be negative."
-            )
+            raise ValueError("Gem reward cannot be negative.")
 
         return await self._grant_reward(
             user_id=user_id,
@@ -645,24 +609,16 @@ class RewardsService:
         self._validate_user_id(user_id)
 
         if currency < 0:
-            raise ValueError(
-                "Currency reward cannot be negative."
-            )
+            raise ValueError("Currency reward cannot be negative.")
 
         if xp < 0:
-            raise ValueError(
-                "XP reward cannot be negative."
-            )
+            raise ValueError("XP reward cannot be negative.")
 
         if gems < 0:
-            raise ValueError(
-                "Gem reward cannot be negative."
-            )
+            raise ValueError("Gem reward cannot be negative.")
 
         if not source or not source.strip():
-            raise ValueError(
-                "Reward source cannot be empty."
-            )
+            raise ValueError("Reward source cannot be empty.")
 
         source = source.strip()
 
@@ -705,10 +661,6 @@ class RewardsService:
             xp=xp,
             source=source,
             rewarded=rewarded,
-            reason=(
-                None
-                if rewarded
-                else "empty_reward"
-            ),
+            reason=None if rewarded else "empty_reward",
         )
 ```
