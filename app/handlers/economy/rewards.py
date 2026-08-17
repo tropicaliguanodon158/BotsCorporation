@@ -1,4 +1,4 @@
-```python
+
 from __future__ import annotations
 
 from aiogram import Router
@@ -104,4 +104,3 @@ async def daily_handler(
         f"⭐ +{result.xp} XP\n"
         f"💎 +{result.gems}"
     )
-```
