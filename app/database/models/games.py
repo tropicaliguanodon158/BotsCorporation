@@ -205,6 +205,10 @@ class GameBet(Base):
     Отдельная ставка.
 
     Используется для финансового аудита.
+
+    Одна и та же ставка пользователя в рамках
+    конкретной игровой сессии не должна создаваться
+    несколько раз.
     """
 
     __tablename__ = "game_bets"
@@ -261,4 +265,12 @@ class GameBet(Base):
         server_default=func.now(),
         nullable=False,
         index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "game_id",
+            "user_id",
+            name="uq_game_bet_user",
+        ),
     )
