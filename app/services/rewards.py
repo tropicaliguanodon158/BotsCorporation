@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from app.services.progression import ProgressionService
+
 from app.database.repositories.economy import EconomyRepository
 from app.database.repositories.settings import SettingsRepository
 from app.database.repositories.users import UserRepository
@@ -601,12 +603,26 @@ class RewardsService:
             Decimal("0.01")
         )
 
-        if currency > 0:
-            await self.economy.add_balance(
+        progression = None
+
+        if xp > 0:
+            user = await self.users.add_xp(
                 user_id=user_id,
-                amount=currency,
-                transaction_type="reward",
-                source=source,
+                amount=xp,
+            )
+
+            if user is None:
+                raise ValueError(
+                    f"User {user_id} does not exist."
+                )
+
+            progression = ProgressionService(
+                self.users.session
+            )
+
+            await progression.add_xp(
+                user_id=user_id,
+                amount=xp,
             )
 
         if gems > 0:

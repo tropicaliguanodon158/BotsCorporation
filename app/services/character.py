@@ -225,9 +225,22 @@ class CharacterService:
     @staticmethod
     def xp_for_level(level: int) -> int:
         """
-        XP, необходимый для достижения указанного уровня.
+        XP для достижения указанного уровня.
+
+        Уровень 1:
+            0 XP
+
+        Уровень 2:
+            400 XP
+
+        Уровень 3:
+            900 XP
+
+        Уровень 4:
+            1600 XP
 
         Формула:
+
             100 * level²
         """
 
@@ -256,7 +269,9 @@ class CharacterService:
                 "Character does not exist."
             )
 
-        await self._recalculate_level(character)
+        await self._recalculate_level(
+            character
+        )
 
         return character
 
@@ -264,38 +279,218 @@ class CharacterService:
         self,
         character: Character,
     ) -> Character:
+        """
+        Пересчитывает уровень и автоматически назначает
+        максимально доступный ранг.
+
+        Один большой XP reward может поднять персонажа
+        сразу на несколько уровней.
+        """
+
+        old_level = character.level
+
         new_level = 1
 
         while (
             new_level < 1000
-            and character.xp >= self.xp_for_level(new_level + 1)
+            and character.xp >= self.xp_for_level(
+                new_level + 1
+            )
         ):
             new_level += 1
 
-        if new_level != character.level:
-            old_level = character.level
+        # ========================================================================
+        # LEVEL
+        # ========================================================================
 
+        if new_level != old_level:
             await self.repository.set_level(
                 character.user_id,
                 new_level,
             )
 
-            if new_level > old_level:
+            level_difference = (
+                new_level - old_level
+            )
+
+            if level_difference > 0:
                 await self.repository.update_stats(
                     character.user_id,
-                    max_hp=character.max_hp + (
-                        (new_level - old_level) * 5
+                    max_hp=(
+                        character.max_hp
+                        + level_difference * 5
                     ),
-                    hp=character.hp + (
-                        (new_level - old_level) * 5
+                    hp=(
+                        character.hp
+                        + level_difference * 5
                     ),
-                    strength=character.strength + (
-                        new_level - old_level
+                    strength=(
+                        character.strength
+                        + level_difference
                     ),
                 )
 
+        # ========================================================================
+        # AUTOMATIC RANK
+        # ========================================================================
+
+        character = await self.repository.get_character(
+            character.user_id
+        )
+
+        if character is None:
+            raise RuntimeError(
+                "Character disappeared during level recalculation."
+            )
+
+        ranks = await self.repository.get_active_ranks()
+
+        eligible_rank = None
+
+        for rank in ranks:
+            # У персонажа пока нет отдельного reputation-поля.
+            # Поэтому rank с reputation requirement > 0
+            # автоматически не назначается.
+            if rank.required_reputation > 0:
+                continue
+
+            if character.level < rank.required_level:
+                continue
+
+            if character.xp < rank.required_xp:
+                continue
+
+            # Берём только ранг выше текущего.
+            if (
+                character.rank_id is not None
+                and rank.id == character.rank_id
+            ):
+                eligible_rank = rank
+                continue
+
+            if (
+                character.rank_id is not None
+            ):
+                current_rank = await self.repository.get_rank(
+                    character.rank_id
+                )
+
+                if (
+                    current_rank is not None
+                    and rank.level <= current_rank.level
+                ):
+                    continue
+
+            eligible_rank = rank
+
+        # ========================================================================
+        # APPLY RANK
+        # ========================================================================
+
+        if (
+            eligible_rank is not None
+            and eligible_rank.id != character.rank_id
+        ):
+            old_rank = None
+
+            if character.rank_id is not None:
+                old_rank = await self.repository.get_rank(
+                    character.rank_id
+                )
+
+            await self.repository.update_character(
+                character.user_id,
+                rank_id=eligible_rank.id,
+            )
+
+            # При первом назначении применяем весь бонус.
+            #
+            # При переходе с одного ранга на другой
+            # применяем разницу между бонусами.
+            #
+            # Благодаря этому:
+            #
+            # Новобранец +5 STR
+            # Воин +10 STR
+            #
+            # переход даст +5 STR, а не +10.
+            old_hp = (
+                old_rank.hp_bonus
+                if old_rank is not None
+                else 0
+            )
+
+            old_strength = (
+                old_rank.strength_bonus
+                if old_rank is not None
+                else 0
+            )
+
+            old_defense = (
+                old_rank.defense_bonus
+                if old_rank is not None
+                else 0
+            )
+
+            old_luck = (
+                old_rank.luck_bonus
+                if old_rank is not None
+                else 0
+            )
+
+            old_speed = (
+                old_rank.speed_bonus
+                if old_rank is not None
+                else 0
+            )
+
+            old_intelligence = (
+                old_rank.intelligence_bonus
+                if old_rank is not None
+                else 0
+            )
+
+            await self.repository.update_stats(
+                character.user_id,
+                max_hp=(
+                    character.max_hp
+                    + eligible_rank.hp_bonus
+                    - old_hp
+                ),
+                hp=(
+                    character.hp
+                    + eligible_rank.hp_bonus
+                    - old_hp
+                ),
+                strength=(
+                    character.strength
+                    + eligible_rank.strength_bonus
+                    - old_strength
+                ),
+                defense=(
+                    character.defense
+                    + eligible_rank.defense_bonus
+                    - old_defense
+                ),
+                luck=(
+                    character.luck
+                    + eligible_rank.luck_bonus
+                    - old_luck
+                ),
+                speed=(
+                    character.speed
+                    + eligible_rank.speed_bonus
+                    - old_speed
+                ),
+                intelligence=(
+                    character.intelligence
+                    + eligible_rank.intelligence_bonus
+                    - old_intelligence
+                ),
+            )
+
         refreshed = await self.repository.get_character(
-            character.user_id,
+            character.user_id
         )
 
         if refreshed is None:

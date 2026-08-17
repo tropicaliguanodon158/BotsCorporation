@@ -1,3 +1,5 @@
+from app.database.repositories.characters import CharacterRepository
+from app.services.progression import ProgressionService
 
 from __future__ import annotations
 
@@ -155,11 +157,74 @@ class UserMiddleware(BaseMiddleware):
                 user_repository=user_repository,
             )
 
-            await rewards_service.message_reward(
+            character_repository = CharacterRepository(
+                session
+            )
+
+            character_before = await character_repository.get_character(
+                telegram_user.id
+            )
+
+            result = await rewards_service.message_reward(
                 user_id=telegram_user.id,
                 chat_id=chat_id,
                 message_type=message_type,
             )
+
+            result = await rewards_service.message_reward(
+                user_id=telegram_user.id,
+                chat_id=chat_id,
+                message_type=message_type,
+            )
+
+            character_after = await character_repository.get_character(
+                telegram_user.id
+            )
+
+            if (
+                character_before is not None
+                and character_after is not None
+            ):
+                if character_after.level > character_before.level:
+                    levels = (
+                        character_after.level
+                        - character_before.level
+                    )
+
+                    text = (
+                        "🎉 <b>НОВЫЙ УРОВЕНЬ!</b>\n\n"
+                        f"⚔️ {character_after.name}\n"
+                        f"📈 Уровень: "
+                        f"<b>{character_before.level} → "
+                        f"{character_after.level}</b>\n"
+                        f"⭐ Получено уровней: <b>{levels}</b>\n\n"
+                        "🎁 Награда за повышение:\n"
+                        "💰 +10 монет\n"
+                        "💎 +1 гем за каждый уровень"
+                    )
+
+                    await event.answer(
+                        text
+                    )
+
+                if (
+                    character_after.rank_id is not None
+                    and character_after.rank_id
+                    != character_before.rank_id
+                ):
+                    rank = await character_repository.get_rank(
+                        character_after.rank_id
+                    )
+
+                    if rank is not None:
+                        await event.answer(
+                            "🏆 <b>НОВЫЙ РАНГ!</b>\n\n"
+                            f"⚔️ Персонаж: "
+                            f"<b>{character_after.name}</b>\n"
+                            f"🎖 Новый ранг: "
+                            f"<b>{rank.name}</b>\n\n"
+                            f"📜 {rank.description}"
+                        )
 
             updated_user = await user_repository.get_by_id(
                 telegram_user.id,

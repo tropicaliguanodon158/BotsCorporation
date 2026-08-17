@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime
 
+from app.services.progression import ProgressionService
+
 from app.database.repositories.tasks import TasksRepository
 from app.database.repositories.users import UserRepository
 
@@ -177,10 +179,26 @@ class EventsService:
                 "XP amount must be greater than zero."
             )
 
-        return await self.user_repository.add_xp(
+        user = await self.user_repository.add_xp(
             user_id=user_id,
             amount=amount,
         )
+
+        if user is None:
+            raise ValueError(
+                "User does not exist."
+            )
+
+        progression = ProgressionService(
+            self.user_repository.session
+        )
+
+        await progression.add_xp(
+            user_id=user_id,
+            amount=amount,
+        )
+
+        return user
 
     # ========================================================================
     # REPUTATION
@@ -238,6 +256,15 @@ class EventsService:
         if xp > 0:
             user.xp += xp
 
+            progression = ProgressionService(
+                self.user_repository.session
+            )
+
+            await progression.add_xp(
+                user_id=user_id,
+                amount=xp,
+            )
+
         if reputation != 0:
             user.reputation += reputation
 
@@ -267,6 +294,15 @@ class EventsService:
 
         if xp > 0:
             user.xp += xp
+
+            progression = ProgressionService(
+                self.user_repository.session
+            )
+
+            await progression.add_xp(
+                user_id=user_id,
+                amount=xp,
+            )
 
         if reputation != 0:
             user.reputation += reputation
