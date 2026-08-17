@@ -19,9 +19,15 @@ class SettingsRepository:
     Основные настройки находятся в модели Chat.
     Дополнительные динамические настройки хранятся
     в Chat.settings_json.
+
+    Все изменения выполняются в текущей SQLAlchemy session.
+    commit/rollback выполняется внешним middleware.
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+    ) -> None:
         self.session = session
 
     # ========================================================================
@@ -33,7 +39,9 @@ class SettingsRepository:
         chat_id: int,
     ) -> Chat | None:
         result = await self.session.execute(
-            select(Chat).where(Chat.id == chat_id)
+            select(Chat).where(
+                Chat.id == chat_id,
+            )
         )
 
         return result.scalar_one_or_none()
@@ -46,16 +54,29 @@ class SettingsRepository:
         username: str | None = None,
         chat_type: str = "group",
     ) -> Chat:
-        chat = await self.get_chat(chat_id)
+        if chat_id == 0:
+            raise ValueError(
+                "Invalid chat_id."
+            )
+
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is not None:
             changed = False
 
-            if title is not None and chat.title != title:
+            if (
+                title is not None
+                and chat.title != title
+            ):
                 chat.title = title
                 changed = True
 
-            if username is not None and chat.username != username:
+            if (
+                username is not None
+                and chat.username != username
+            ):
                 chat.username = username
                 changed = True
 
@@ -82,18 +103,20 @@ class SettingsRepository:
         return chat
 
     # ========================================================================
-    # JSON HELPERS
+    # JSON
     # ========================================================================
 
     @staticmethod
     def _load_settings(
         chat: Chat,
     ) -> dict[str, Any]:
-        if not chat.settings_json:
+        raw = chat.settings_json
+
+        if not raw:
             return {}
 
         try:
-            data = json.loads(chat.settings_json)
+            data = json.loads(raw)
         except (
             json.JSONDecodeError,
             TypeError,
@@ -114,7 +137,10 @@ class SettingsRepository:
         chat.settings_json = json.dumps(
             values,
             ensure_ascii=False,
-            separators=(",", ":"),
+            separators=(
+                ",",
+                ":",
+            ),
         )
 
     # ========================================================================
@@ -128,26 +154,42 @@ class SettingsRepository:
         key: str,
         default: T | None = None,
     ) -> T | None:
-        chat = await self.get_chat(chat_id)
+        key = key.strip()
+
+        if not key:
+            return default
+
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             return default
 
-        values = self._load_settings(chat)
+        values = self._load_settings(
+            chat,
+        )
 
-        return values.get(key, default)
+        return values.get(
+            key,
+            default,
+        )
 
     async def get_all(
         self,
         *,
         chat_id: int,
     ) -> dict[str, Any]:
-        chat = await self.get_chat(chat_id)
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             return {}
 
-        return self._load_settings(chat)
+        return self._load_settings(
+            chat,
+        )
 
     async def get_by_prefix(
         self,
@@ -158,6 +200,8 @@ class SettingsRepository:
         values = await self.get_all(
             chat_id=chat_id,
         )
+
+        prefix = prefix.strip()
 
         if not prefix:
             return values
@@ -186,14 +230,18 @@ class SettingsRepository:
                 "Setting key cannot be empty."
             )
 
-        chat = await self.get_chat(chat_id)
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             raise ValueError(
                 f"Chat {chat_id} does not exist."
             )
 
-        values = self._load_settings(chat)
+        values = self._load_settings(
+            chat,
+        )
 
         values[key] = value
 
@@ -212,24 +260,28 @@ class SettingsRepository:
         chat_id: int,
         values: dict[str, Any],
     ) -> dict[str, Any]:
-        chat = await self.get_chat(chat_id)
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             raise ValueError(
                 f"Chat {chat_id} does not exist."
             )
 
-        current = self._load_settings(chat)
+        current = self._load_settings(
+            chat,
+        )
 
         for key, value in values.items():
-            key = key.strip()
+            normalized_key = key.strip()
 
-            if not key:
+            if not normalized_key:
                 raise ValueError(
                     "Setting key cannot be empty."
                 )
 
-            current[key] = value
+            current[normalized_key] = value
 
         self._save_settings(
             chat,
@@ -250,12 +302,21 @@ class SettingsRepository:
         chat_id: int,
         key: str,
     ) -> bool:
-        chat = await self.get_chat(chat_id)
+        key = key.strip()
+
+        if not key:
+            return False
+
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             return False
 
-        values = self._load_settings(chat)
+        values = self._load_settings(
+            chat,
+        )
 
         if key not in values:
             return False
@@ -277,12 +338,21 @@ class SettingsRepository:
         chat_id: int,
         prefix: str,
     ) -> int:
-        chat = await self.get_chat(chat_id)
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             return 0
 
-        values = self._load_settings(chat)
+        prefix = prefix.strip()
+
+        if not prefix:
+            return 0
+
+        values = self._load_settings(
+            chat,
+        )
 
         keys = [
             key
@@ -290,16 +360,18 @@ class SettingsRepository:
             if key.startswith(prefix)
         ]
 
+        if not keys:
+            return 0
+
         for key in keys:
             del values[key]
 
-        if keys:
-            self._save_settings(
-                chat,
-                values,
-            )
+        self._save_settings(
+            chat,
+            values,
+        )
 
-            await self.session.flush()
+        await self.session.flush()
 
         return len(keys)
 
@@ -312,7 +384,9 @@ class SettingsRepository:
         *,
         chat_id: int,
     ) -> bool:
-        chat = await self.get_chat(chat_id)
+        chat = await self.get_chat(
+            chat_id,
+        )
 
         if chat is None:
             return False
