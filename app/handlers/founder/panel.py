@@ -5,9 +5,12 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.config.settings import get_settings
+from app.keyboards.founder import founder_main_keyboard
 
 
-router = Router(name="founder_panel")
+router = Router(
+    name="founder_panel",
+)
 
 
 def _is_founder(user_id: int) -> bool:
@@ -34,16 +37,7 @@ async def founder_panel_handler(
 
     await message.answer(
         "👑 <b>Founder Panel</b>\n\n"
-        "Доступ к панели основателя подтверждён.\n\n"
-        "Разделы панели:\n"
-        "⚙️ <code>/founder_settings</code> — настройки\n"
-        "💰 <code>/founder_economy</code> — экономика\n"
-        "👥 <code>/founder_users</code> — пользователи\n"
-        "💬 <code>/founder_chats</code> — чаты\n"
-        "🛡 <code>/founder_moderation</code> — модерация\n"
-        "🧙 <code>/founder_races</code> — расы\n"
-        "🏷 <code>/founder_ranks</code> — ранги\n"
-        "✨ <code>/founder_abilities</code> — способности\n"
-        "📦 <code>/founder_cases</code> — кейсы\n"
-        "🛒 <code>/founder_shop</code> — магазин"
+        "Добро пожаловать в панель основателя.\n"
+        "Выбери нужный раздел:",
+        reply_markup=founder_main_keyboard(),
     )

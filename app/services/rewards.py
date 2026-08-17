@@ -161,27 +161,19 @@ class RewardsService:
         source: str,
         since: datetime,
     ) -> bool:
-        transactions = await self.economy.get_transactions(
+        """
+        Проверяет наличие недавней транзакции
+        указанного типа.
+
+        Запрос выполняется непосредственно к БД,
+        без загрузки истории транзакций пользователя.
+        """
+
+        return await self.economy.has_recent_transaction(
             user_id=user_id,
-            limit=100,
-            offset=0,
+            source=source,
+            since=since,
         )
-
-        for transaction in transactions:
-            if transaction.source != source:
-                continue
-
-            created_at = transaction.created_at
-
-            if created_at.tzinfo is not None:
-                created_at = created_at.replace(
-                    tzinfo=None
-                )
-
-            if created_at >= since:
-                return True
-
-        return False
 
     # ========================================================================
     # MESSAGE
@@ -354,7 +346,7 @@ class RewardsService:
         self,
         *,
         user_id: int,
-        chat_id: int | None,
+        chat_id: int | None = None,
     ) -> RewardResult:
         self._validate_user_id(user_id)
 
@@ -367,20 +359,29 @@ class RewardsService:
                 f"User {user_id} does not exist."
             )
 
-        since = self._now() - timedelta(hours=1)
+        now = self._now()
 
-        if await self._has_recent_transaction(
-            user_id=user_id,
-            source="hourly_reward",
-            since=since,
-        ):
-            return RewardResult(
-                user_id=user_id,
-                chat_id=chat_id,
-                source="hourly_reward",
-                rewarded=False,
-                reason="cooldown",
-            )
+        # ------------------------------------------------------------
+        # Hourly cooldown
+        #
+        # Храним время последнего получения непосредственно
+        # в users.last_hourly_at.
+        #
+        # Это не зависит от transactions и не позволяет
+        # повторно забрать hourly после успешной выдачи.
+        # ------------------------------------------------------------
+
+        if user.last_hourly_at is not None:
+            elapsed = now - user.last_hourly_at
+
+            if elapsed < timedelta(hours=1):
+                return RewardResult(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    source="hourly_reward",
+                    rewarded=False,
+                    reason="cooldown",
+                )
 
         currency = await self._get_setting(
             chat_id=chat_id,
@@ -400,23 +401,34 @@ class RewardsService:
             default=self.DEFAULT_HOURLY_GEMS,
         )
 
-        return await self._grant_reward(
+        currency = self._decimal(
+            currency,
+            self.DEFAULT_HOURLY_REWARD,
+        )
+
+        xp = self._int(
+            xp,
+            self.DEFAULT_HOURLY_XP,
+        )
+
+        gems = self._int(
+            gems,
+            self.DEFAULT_HOURLY_GEMS,
+        )
+
+        result = await self._grant_reward(
             user_id=user_id,
             chat_id=chat_id,
-            currency=self._decimal(
-                currency,
-                self.DEFAULT_HOURLY_REWARD,
-            ),
-            xp=self._int(
-                xp,
-                self.DEFAULT_HOURLY_XP,
-            ),
-            gems=self._int(
-                gems,
-                self.DEFAULT_HOURLY_GEMS,
-            ),
+            currency=currency,
+            xp=xp,
+            gems=gems,
             source="hourly_reward",
         )
+
+        if result.rewarded:
+            user.last_hourly_at = now
+
+        return result
 
     # ========================================================================
     # DAILY

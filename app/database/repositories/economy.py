@@ -849,6 +849,33 @@ class EconomyRepository:
     # TRANSACTION HISTORY
     # ========================================================================
 
+    async def has_recent_transaction(
+        self,
+        *,
+        user_id: int,
+        source: str,
+        since,
+    ) -> bool:
+        """
+        Проверяет наличие транзакции указанного типа
+        начиная с указанного времени.
+
+        Используется для cooldown-механик:
+        hourly, daily и т.д.
+        """
+
+        result = await self.session.execute(
+            select(Transaction.id)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.source == source,
+                Transaction.created_at >= since,
+            )
+            .limit(1)
+        )
+
+        return result.scalar_one_or_none() is not None
+
     async def get_transactions(
         self,
         user_id: int,

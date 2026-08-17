@@ -4,7 +4,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from app.database.models.user import User
+from app.database.repositories.users import UserRepository
 
 
 router = Router(
@@ -15,11 +15,28 @@ router = Router(
 @router.message(Command("profile"))
 async def profile_handler(
     message: Message,
-    user: User,
+    session,
 ) -> None:
     """
     Показывает базовый профиль пользователя.
     """
+
+    if message.from_user is None:
+        return
+
+    repository = UserRepository(
+        session,
+    )
+
+    user = await repository.get_by_id(
+        message.from_user.id,
+    )
+
+    if user is None:
+        await message.answer(
+            "❌ Пользователь не найден."
+        )
+        return
 
     username = (
         f"@{user.username}"

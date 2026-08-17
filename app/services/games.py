@@ -550,6 +550,26 @@ class GamesService:
         bet_type: str,
         selection: str | None,
     ) -> GamePlayer:
+        """
+        Поставить деньги в игре.
+
+        Последовательность:
+
+            1. Проверка игры.
+            2. Проверка существующей ставки.
+            3. Списание денег.
+            4. Если денег недостаточно — игра отменяется.
+            5. Создание GameBet.
+            6. Обновление pot.
+
+        Commit/rollback выполняется middleware.
+
+        Важно:
+            Если ставка не может быть списана из-за недостатка
+            средств, созданная игра переводится в cancelled.
+            Это предотвращает появление зависшей active-игры.
+        """
+
         game = await self.repository.get_game(
             game_id
         )
@@ -633,6 +653,29 @@ class GamesService:
         )
 
         if transaction is None:
+            # ------------------------------------------------------------
+            # Недостаточно денег.
+            #
+            # Игра уже была создана до попытки списания.
+            # Если просто выбросить ValueError, middleware
+            # закоммитит созданную игру и она останется active.
+            #
+            # Поэтому явно переводим её в cancelled.
+            # ------------------------------------------------------------
+
+            cancelled_game = await self.repository.update_game(
+                game.id,
+                pot=Decimal("0.00"),
+                status="cancelled",
+                finished_at=datetime.now(),
+            )
+
+            if cancelled_game is None:
+                raise RuntimeError(
+                    "Failed to cancel game after "
+                    "insufficient balance."
+                )
+
             raise ValueError(
                 "Insufficient balance."
             )

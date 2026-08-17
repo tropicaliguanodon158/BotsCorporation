@@ -106,7 +106,35 @@ async def _ensure_sqlite_schema(
     def inspect_schema(sync_connection) -> None:
         inspector = inspect(sync_connection)
 
-        if "transactions" not in inspector.get_table_names():
+        table_names = inspector.get_table_names()
+
+        # --------------------------------------------------------------
+        # Users
+        # --------------------------------------------------------------
+
+        if "users" in table_names:
+            user_columns = {
+                column["name"]
+                for column in inspector.get_columns(
+                    "users"
+                )
+            }
+
+            if "last_hourly_at" not in user_columns:
+                sync_connection.execute(
+                    text(
+                        """
+                        ALTER TABLE users
+                        ADD COLUMN last_hourly_at DATETIME
+                        """
+                    )
+                )
+
+        # --------------------------------------------------------------
+        # Transactions
+        # --------------------------------------------------------------
+
+        if "transactions" not in table_names:
             return
 
         unique_constraints = (
