@@ -314,35 +314,102 @@ class GamesService:
         game = await self.repository.get_game(
             game_id
         )
-
+    
         if game is None:
             raise ValueError(
                 "Game does not exist."
             )
-
+    
         if game.status not in self.ACTIVE_STATUSES:
             raise ValueError(
                 "Game is not active."
             )
-
+    
         amount = self._normalize_amount(
             amount
         )
-
+    
+        # ------------------------------------------------------------------------
+        # IDEMPOTENCY
+        # ------------------------------------------------------------------------
+        #
+        # Если Telegram повторно доставит update или handler будет
+        # вызван повторно, существующая ставка должна быть возвращена,
+        # а не создана заново.
+        #
+        # Это особенно важно, потому что EconomyRepository уже защищает
+        # финансовую транзакцию через reference_id.
+        # ------------------------------------------------------------------------
+    
+        existing_bet = await self.repository.get_user_bet(
+            game_id=game_id,
+            user_id=user_id,
+        )
+    
+        if existing_bet is not None:
+            existing_amount = Decimal(
+                str(existing_bet.amount)
+            )
+    
+            if existing_amount != amount:
+                raise ValueError(
+                    "A different bet already exists for this game."
+                )
+    
+            if existing_bet.bet_type != bet_type:
+                raise ValueError(
+                    "A different bet type already exists for this game."
+                )
+    
+            if existing_bet.selection != selection:
+                raise ValueError(
+                    "A different bet selection already exists for this game."
+                )
+    
+            return existing_bet
+    
+        # ------------------------------------------------------------------------
+        # CHARGE
+        # ------------------------------------------------------------------------
+    
         reference_id = self._bet_reference(
             game.round_id,
             user_id,
         )
-
-        await self._charge(
+    
+        transaction = await self.economy.remove_balance(
             user_id=user_id,
             amount=amount,
-            source=(
-                f"game:{game.game_type}:bet"
-            ),
+            transaction_type="game_bet",
+            source=f"game:{game.game_type}:bet",
             reference_id=reference_id,
         )
-
+    
+        if transaction is None:
+            raise ValueError(
+                "Insufficient balance."
+            )
+    
+        # ------------------------------------------------------------------------
+        # PROTECTION AGAINST REFERENCE COLLISION
+        # ------------------------------------------------------------------------
+        #
+        # Если reference_id уже существовал, EconomyRepository вернёт
+        # старую транзакцию. Она должна соответствовать текущей ставке.
+        #
+        # В противном случае нельзя продолжать операцию.
+        # ------------------------------------------------------------------------
+    
+        transaction_amount = Decimal(
+            str(transaction.amount)
+        )
+    
+        if transaction_amount != -amount:
+            raise RuntimeError(
+                "Existing game transaction does not match "
+                "the requested bet amount."
+            )
+    
         try:
             bet = await self.repository.create_bet(
                 game_id=game_id,
@@ -351,31 +418,35 @@ class GamesService:
                 bet_type=bet_type,
                 selection=selection,
             )
-
+    
             game.pot += amount
-
-            await self.repository.update_game(
+    
+            updated_game = await self.repository.update_game(
                 game.id,
                 pot=game.pot,
             )
-
-            return bet
-
-        except Exception:
-            try:
-                await self._refund_bet(
-                    user_id=user_id,
-                    amount=amount,
-                    game=game,
+    
+            if updated_game is None:
+                raise RuntimeError(
+                    "Game disappeared while placing a bet."
                 )
-            except Exception:
-                # Исходная ошибка важнее.
-                # Если возврат тоже упал, внешний логгер
-                # должен зафиксировать обе ошибки.
-                raise
-
+    
+            return bet
+    
+        except Exception:
+            # Все изменения находятся в одной SQLAlchemy session.
+            #
+            # DatabaseMiddleware при исключении выполнит rollback,
+            # поэтому здесь НЕ создаём дополнительный возврат денег.
+            #
+            # Иначе получится:
+            #
+            # списание
+            # + возврат
+            # + rollback
+            #
+            # и логика станет крайне легко ломаемой.
             raise
-
     # ========================================================================
     # VALIDATION
     # ========================================================================

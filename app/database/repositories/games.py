@@ -756,6 +756,34 @@ class GamesRepository:
 
         return result.scalars().all()
 
+    async def get_user_bet(
+        self,
+        *,
+        game_id: int,
+        user_id: int,
+    ) -> GameBet | None:
+        """
+        Получить ставку пользователя в конкретной игре.
+    
+        Нужен для идемпотентности:
+        повторная обработка одного Telegram update
+        не должна создавать вторую GameBet.
+        """
+    
+        result = await self.session.execute(
+            select(GameBet)
+            .where(
+                GameBet.game_id == game_id,
+                GameBet.user_id == user_id,
+            )
+            .order_by(
+                GameBet.id.desc(),
+            )
+            .limit(1)
+        )
+    
+        return result.scalar_one_or_none()
+
     async def update_bet_payout(
         self,
         bet_id: int,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from typing import Sequence
 
 from sqlalchemy import select, update
@@ -15,6 +17,8 @@ class UserRepository:
     Только работа с таблицей users.
     Бизнес-логика находится в service-слое.
     """
+    _mutation_lock = asyncio.Lock()
+
 
     def __init__(
         self,
@@ -141,7 +145,7 @@ class UserRepository:
     # ========================================================================
     # GET OR CREATE
     # ========================================================================
-
+    
     async def get_or_create(
         self,
         user_id: int,
@@ -151,28 +155,32 @@ class UserRepository:
     ) -> tuple[User, bool]:
         """
         Получает пользователя или создаёт его.
-
-        users.id является PRIMARY KEY и дополнительно
-        защищает от существования двух одинаковых
-        Telegram пользователей.
+    
+        Для SQLite бот работает одним процессом, поэтому
+        дополнительный asyncio.Lock полностью закрывает
+        race condition между одновременно обрабатываемыми
+        Telegram update.
+    
+        users.id дополнительно защищён PRIMARY KEY.
         """
-
-        user = await self.get_by_id(
-            user_id
-        )
-
-        if user is not None:
-            return user, False
-
-        user = await self.create(
-            user_id=user_id,
-            first_name=first_name,
-            last_name=last_name,
-            username=username,
-        )
-
-        return user, True
-
+    
+        async with self._mutation_lock:
+            user = await self.get_by_id(
+                user_id
+            )
+    
+            if user is not None:
+                return user, False
+    
+            user = await self.create(
+                user_id=user_id,
+                first_name=first_name,
+                last_name=last_name,
+                username=username,
+            )
+    
+            return user, True
+            
     # ========================================================================
     # UPDATE
     # ========================================================================
