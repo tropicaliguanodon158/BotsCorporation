@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
 
 from app.database.repositories.tasks import TasksRepository
 from app.database.repositories.users import UserRepository
@@ -9,19 +8,12 @@ from app.database.repositories.users import UserRepository
 
 class EventsService:
     """
-    Центральная обработка событий пользователя.
+    Центральная обработка игровых и пользовательских событий.
 
-    Отвечает за:
-        - регистрацию пользователя;
-        - обработку сообщений;
-        - статистику ежедневной активности;
-        - XP;
-        - репутацию;
-        - игровые события.
+    Важно:
+        commit()/rollback() выполняет DatabaseMiddleware.
 
-    Telegram API здесь не используется.
-
-    commit()/rollback() выполняет DatabaseMiddleware.
+    Сервис не обращается к Telegram API.
     """
 
     def __init__(
@@ -76,18 +68,20 @@ class EventsService:
         user_id: int,
         message_type: str = "text",
         activity_date: date | None = None,
-        xp: int = 1,
+        xp: int = 0,
     ):
         """
-        Обработать сообщение пользователя.
+        Обрабатывает обычное сообщение.
 
         Изменяет:
             - общий счётчик сообщений;
             - дневной счётчик;
-            - UserDailyActivity;
+            - дневную активность;
             - XP.
 
-        Никаких сообщений пользователю здесь не отправляется.
+        Возвращает уже обновлённого пользователя.
+
+        Все изменения находятся в одной SQLAlchemy session.
         """
 
         user = await self.user_repository.get_by_id(
@@ -114,13 +108,16 @@ class EventsService:
         }:
             message_type = "other"
 
-        await self.user_repository.increment_message_count(
-            user_id=user_id,
-        )
+        # ====================================================================
+        # MESSAGE COUNTERS
+        # ====================================================================
 
-        await self.user_repository.increment_daily_message_count(
-            user_id=user_id,
-        )
+        user.message_count += 1
+        user.daily_message_count += 1
+
+        # ====================================================================
+        # DAILY ACTIVITY
+        # ====================================================================
 
         if self.tasks_repository is not None:
             await self.tasks_repository.increment_daily_activity(
@@ -132,22 +129,19 @@ class EventsService:
                 message_type=message_type,
             )
 
+        # ====================================================================
+        # XP
+        # ====================================================================
+
         if xp > 0:
-            await self.user_repository.add_xp(
-                user_id=user_id,
-                amount=xp,
-            )
+            user.xp += xp
 
-        result = await self.user_repository.get_by_id(
-            user_id,
-        )
+        # Изменения уже находятся в session.
+        # Отдельные UPDATE + повторный SELECT здесь не нужны.
 
-        if result is None:
-            raise RuntimeError(
-                "User disappeared after message processing."
-            )
+        await self.user_repository.session.flush()
 
-        return result
+        return user
 
     # ========================================================================
     # XP
@@ -223,20 +217,14 @@ class EventsService:
             )
 
         if xp > 0:
-            await self.user_repository.add_xp(
-                user_id=user_id,
-                amount=xp,
-            )
+            user.xp += xp
 
         if reputation != 0:
-            await self.user_repository.add_reputation(
-                user_id=user_id,
-                amount=reputation,
-            )
+            user.reputation += reputation
 
-        return await self.user_repository.get_by_id(
-            user_id,
-        )
+        await self.user_repository.session.flush()
+
+        return user
 
     # ========================================================================
     # GAME LOSS
@@ -259,17 +247,11 @@ class EventsService:
             )
 
         if xp > 0:
-            await self.user_repository.add_xp(
-                user_id=user_id,
-                amount=xp,
-            )
+            user.xp += xp
 
         if reputation != 0:
-            await self.user_repository.add_reputation(
-                user_id=user_id,
-                amount=reputation,
-            )
+            user.reputation += reputation
 
-        return await self.user_repository.get_by_id(
-            user_id,
-        )
+        await self.user_repository.session.flush()
+
+        return user
