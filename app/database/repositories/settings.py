@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 import json
@@ -21,9 +22,6 @@ class SettingsRepository:
 
     Дополнительные динамические настройки хранятся
     в Chat.settings_json.
-
-    Это позволяет Founder Panel добавлять новые
-    параметры без изменения структуры БД.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -37,9 +35,7 @@ class SettingsRepository:
         self,
         chat_id: int,
     ) -> Chat | None:
-        """
-        Получить чат по Telegram ID.
-        """
+        """Получить чат по Telegram ID."""
 
         result = await self.session.execute(
             select(Chat).where(
@@ -57,9 +53,7 @@ class SettingsRepository:
         username: str | None = None,
         chat_type: str = "group",
     ) -> Chat:
-        """
-        Получить существующий чат или создать его.
-        """
+        """Получить существующий чат или создать его."""
 
         chat = await self.get_chat(chat_id)
 
@@ -116,9 +110,7 @@ class SettingsRepository:
         chat: Chat,
         settings: dict[str, Any],
     ) -> None:
-        """
-        Сохранить словарь настроек в JSON.
-        """
+        """Сохранить словарь настроек в JSON."""
 
         chat.settings_json = json.dumps(
             settings,
@@ -139,10 +131,6 @@ class SettingsRepository:
         """
         Получить динамическую настройку.
 
-        Пример:
-
-            economy.hourly_reward
-
         Если параметр отсутствует, возвращается default.
         """
 
@@ -153,9 +141,10 @@ class SettingsRepository:
 
         settings = self._load_settings(chat)
 
-        value = settings.get(key, default)
-
-        return value
+        return settings.get(
+            key,
+            default,
+        )
 
     # ========================================================================
     # DYNAMIC SET
@@ -168,17 +157,7 @@ class SettingsRepository:
         key: str,
         value: Any,
     ) -> Any:
-        """
-        Создать или изменить динамическую настройку.
-
-        Пример:
-
-            await repository.set(
-                chat_id=123,
-                key="games.duel_price",
-                value=100,
-            )
-        """
+        """Создать или изменить динамическую настройку."""
 
         if not key or not key.strip():
             raise ValueError(
@@ -217,9 +196,7 @@ class SettingsRepository:
         chat_id: int,
         key: str,
     ) -> bool:
-        """
-        Удалить динамическую настройку.
-        """
+        """Удалить динамическую настройку."""
 
         chat = await self.get_chat(chat_id)
 
@@ -251,9 +228,7 @@ class SettingsRepository:
         *,
         chat_id: int,
     ) -> dict[str, Any]:
-        """
-        Получить все динамические настройки чата.
-        """
+        """Получить все динамические настройки чата."""
 
         chat = await self.get_chat(chat_id)
 
@@ -277,16 +252,23 @@ class SettingsRepository:
 
         Например:
 
-            economy.
+            rewards.
 
         вернёт:
 
-            economy.hourly_reward
-            economy.daily_reward
-            economy.required_messages
+            rewards.message.currency
+            rewards.message.xp
+            rewards.daily.currency
         """
 
-        settings = await self.get_all(chat_id)
+        if not prefix:
+            return await self.get_all(
+                chat_id=chat_id,
+            )
+
+        settings = await self.get_all(
+            chat_id=chat_id,
+        )
 
         return {
             key: value
@@ -304,9 +286,7 @@ class SettingsRepository:
         chat_id: int,
         values: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Изменить несколько динамических настроек.
-        """
+        """Изменить несколько динамических настроек."""
 
         chat = await self.get_chat(chat_id)
 
@@ -318,7 +298,6 @@ class SettingsRepository:
         settings = self._load_settings(chat)
 
         for key, value in values.items():
-
             if not key or not key.strip():
                 raise ValueError(
                     "Setting key cannot be empty."
@@ -345,12 +324,7 @@ class SettingsRepository:
         chat_id: int,
         prefix: str,
     ) -> int:
-        """
-        Удалить все динамические настройки,
-        начинающиеся с указанного префикса.
-
-        Возвращает количество удалённых параметров.
-        """
+        """Удалить все динамические настройки с указанным префиксом."""
 
         chat = await self.get_chat(chat_id)
 
@@ -390,8 +364,7 @@ class SettingsRepository:
         """
         Полностью очистить settings_json.
 
-        Важно:
-        основные поля Chat при этом НЕ изменяются.
+        Основные поля Chat при этом НЕ изменяются.
         """
 
         chat = await self.get_chat(chat_id)
@@ -404,3 +377,4 @@ class SettingsRepository:
         await self.session.flush()
 
         return True
+```
