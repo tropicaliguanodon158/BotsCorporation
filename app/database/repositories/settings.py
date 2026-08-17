@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import json
@@ -15,11 +14,9 @@ T = TypeVar("T")
 
 class SettingsRepository:
     """
-    Repository для настроек Telegram-чатов.
+    Репозиторий настроек Telegram-чатов.
 
-    Важные и часто используемые настройки находятся
-    непосредственно в модели Chat.
-
+    Основные настройки находятся в модели Chat.
     Дополнительные динамические настройки хранятся
     в Chat.settings_json.
     """
@@ -35,12 +32,8 @@ class SettingsRepository:
         self,
         chat_id: int,
     ) -> Chat | None:
-        """Получить чат по Telegram ID."""
-
         result = await self.session.execute(
-            select(Chat).where(
-                Chat.id == chat_id,
-            )
+            select(Chat).where(Chat.id == chat_id)
         )
 
         return result.scalar_one_or_none()
@@ -53,11 +46,26 @@ class SettingsRepository:
         username: str | None = None,
         chat_type: str = "group",
     ) -> Chat:
-        """Получить существующий чат или создать его."""
-
         chat = await self.get_chat(chat_id)
 
         if chat is not None:
+            changed = False
+
+            if title is not None and chat.title != title:
+                chat.title = title
+                changed = True
+
+            if username is not None and chat.username != username:
+                chat.username = username
+                changed = True
+
+            if chat.chat_type != chat_type:
+                chat.chat_type = chat_type
+                changed = True
+
+            if changed:
+                await self.session.flush()
+
             return chat
 
         chat = Chat(
@@ -74,51 +82,43 @@ class SettingsRepository:
         return chat
 
     # ========================================================================
-    # JSON SETTINGS
+    # JSON HELPERS
     # ========================================================================
 
     @staticmethod
     def _load_settings(
         chat: Chat,
     ) -> dict[str, Any]:
-        """
-        Загрузить settings_json.
-
-        Если JSON отсутствует или повреждён,
-        возвращается пустой словарь.
-        """
-
         if not chat.settings_json:
             return {}
 
         try:
             data = json.loads(chat.settings_json)
-
-            if isinstance(data, dict):
-                return data
-
         except (
             json.JSONDecodeError,
             TypeError,
+            ValueError,
         ):
-            pass
+            return {}
 
-        return {}
+        if not isinstance(data, dict):
+            return {}
+
+        return data
 
     @staticmethod
     def _save_settings(
         chat: Chat,
-        settings: dict[str, Any],
+        values: dict[str, Any],
     ) -> None:
-        """Сохранить словарь настроек в JSON."""
-
         chat.settings_json = json.dumps(
-            settings,
+            values,
             ensure_ascii=False,
+            separators=(",", ":"),
         )
 
     # ========================================================================
-    # DYNAMIC GET
+    # GET
     # ========================================================================
 
     async def get(
@@ -128,26 +128,48 @@ class SettingsRepository:
         key: str,
         default: T | None = None,
     ) -> T | None:
-        """
-        Получить динамическую настройку.
-
-        Если параметр отсутствует, возвращается default.
-        """
-
         chat = await self.get_chat(chat_id)
 
         if chat is None:
             return default
 
-        settings = self._load_settings(chat)
+        values = self._load_settings(chat)
 
-        return settings.get(
-            key,
-            default,
+        return values.get(key, default)
+
+    async def get_all(
+        self,
+        *,
+        chat_id: int,
+    ) -> dict[str, Any]:
+        chat = await self.get_chat(chat_id)
+
+        if chat is None:
+            return {}
+
+        return self._load_settings(chat)
+
+    async def get_by_prefix(
+        self,
+        *,
+        chat_id: int,
+        prefix: str,
+    ) -> dict[str, Any]:
+        values = await self.get_all(
+            chat_id=chat_id,
         )
 
+        if not prefix:
+            return values
+
+        return {
+            key: value
+            for key, value in values.items()
+            if key.startswith(prefix)
+        }
+
     # ========================================================================
-    # DYNAMIC SET
+    # SET
     # ========================================================================
 
     async def set(
@@ -157,9 +179,9 @@ class SettingsRepository:
         key: str,
         value: Any,
     ) -> Any:
-        """Создать или изменить динамическую настройку."""
+        key = key.strip()
 
-        if not key or not key.strip():
+        if not key:
             raise ValueError(
                 "Setting key cannot be empty."
             )
@@ -171,23 +193,55 @@ class SettingsRepository:
                 f"Chat {chat_id} does not exist."
             )
 
-        key = key.strip()
+        values = self._load_settings(chat)
 
-        settings = self._load_settings(chat)
-
-        settings[key] = value
+        values[key] = value
 
         self._save_settings(
             chat,
-            settings,
+            values,
         )
 
         await self.session.flush()
 
         return value
 
+    async def set_many(
+        self,
+        *,
+        chat_id: int,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        chat = await self.get_chat(chat_id)
+
+        if chat is None:
+            raise ValueError(
+                f"Chat {chat_id} does not exist."
+            )
+
+        current = self._load_settings(chat)
+
+        for key, value in values.items():
+            key = key.strip()
+
+            if not key:
+                raise ValueError(
+                    "Setting key cannot be empty."
+                )
+
+            current[key] = value
+
+        self._save_settings(
+            chat,
+            current,
+        )
+
+        await self.session.flush()
+
+        return current
+
     # ========================================================================
-    # DYNAMIC DELETE
+    # DELETE
     # ========================================================================
 
     async def delete(
@@ -196,127 +250,26 @@ class SettingsRepository:
         chat_id: int,
         key: str,
     ) -> bool:
-        """Удалить динамическую настройку."""
-
         chat = await self.get_chat(chat_id)
 
         if chat is None:
             return False
 
-        settings = self._load_settings(chat)
+        values = self._load_settings(chat)
 
-        if key not in settings:
+        if key not in values:
             return False
 
-        del settings[key]
+        del values[key]
 
         self._save_settings(
             chat,
-            settings,
+            values,
         )
 
         await self.session.flush()
 
         return True
-
-    # ========================================================================
-    # GET ALL
-    # ========================================================================
-
-    async def get_all(
-        self,
-        *,
-        chat_id: int,
-    ) -> dict[str, Any]:
-        """Получить все динамические настройки чата."""
-
-        chat = await self.get_chat(chat_id)
-
-        if chat is None:
-            return {}
-
-        return self._load_settings(chat)
-
-    # ========================================================================
-    # GET BY PREFIX
-    # ========================================================================
-
-    async def get_by_prefix(
-        self,
-        *,
-        chat_id: int,
-        prefix: str,
-    ) -> dict[str, Any]:
-        """
-        Получить настройки по префиксу.
-
-        Например:
-
-            rewards.
-
-        вернёт:
-
-            rewards.message.currency
-            rewards.message.xp
-            rewards.daily.currency
-        """
-
-        if not prefix:
-            return await self.get_all(
-                chat_id=chat_id,
-            )
-
-        settings = await self.get_all(
-            chat_id=chat_id,
-        )
-
-        return {
-            key: value
-            for key, value in settings.items()
-            if key.startswith(prefix)
-        }
-
-    # ========================================================================
-    # SET MANY
-    # ========================================================================
-
-    async def set_many(
-        self,
-        *,
-        chat_id: int,
-        values: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Изменить несколько динамических настроек."""
-
-        chat = await self.get_chat(chat_id)
-
-        if chat is None:
-            raise ValueError(
-                f"Chat {chat_id} does not exist."
-            )
-
-        settings = self._load_settings(chat)
-
-        for key, value in values.items():
-            if not key or not key.strip():
-                raise ValueError(
-                    "Setting key cannot be empty."
-                )
-
-            settings[key.strip()] = value
-
-        self._save_settings(
-            chat,
-            settings,
-        )
-
-        await self.session.flush()
-
-        return settings
-
-    # ========================================================================
-    # DELETE BY PREFIX
-    # ========================================================================
 
     async def delete_by_prefix(
         self,
@@ -324,33 +277,31 @@ class SettingsRepository:
         chat_id: int,
         prefix: str,
     ) -> int:
-        """Удалить все динамические настройки с указанным префиксом."""
-
         chat = await self.get_chat(chat_id)
 
         if chat is None:
             return 0
 
-        settings = self._load_settings(chat)
+        values = self._load_settings(chat)
 
-        keys_to_delete = [
+        keys = [
             key
-            for key in settings
+            for key in values
             if key.startswith(prefix)
         ]
 
-        for key in keys_to_delete:
-            del settings[key]
+        for key in keys:
+            del values[key]
 
-        if keys_to_delete:
+        if keys:
             self._save_settings(
                 chat,
-                settings,
+                values,
             )
 
             await self.session.flush()
 
-        return len(keys_to_delete)
+        return len(keys)
 
     # ========================================================================
     # RESET
@@ -361,12 +312,6 @@ class SettingsRepository:
         *,
         chat_id: int,
     ) -> bool:
-        """
-        Полностью очистить settings_json.
-
-        Основные поля Chat при этом НЕ изменяются.
-        """
-
         chat = await self.get_chat(chat_id)
 
         if chat is None:
@@ -377,4 +322,3 @@ class SettingsRepository:
         await self.session.flush()
 
         return True
-```
