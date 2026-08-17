@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from app.bot.bot import create_bot
 from app.bot.dispatcher import create_dispatcher
@@ -8,34 +9,48 @@ from app.config.settings import settings
 from app.database.database import close_database, init_database
 
 
-async def main() -> None:
-    """
-    Главная точка запуска Telegram-бота.
-
-    Порядок запуска:
-
-        1. Инициализация БД.
-        2. Создание Bot.
-        3. Создание Dispatcher.
-        4. Запуск polling.
-        5. Корректное завершение при остановке.
-    """
-
-    print(
-        f"Starting {settings.APP_NAME} "
-        f"in {settings.ENVIRONMENT} environment..."
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=getattr(
+            logging,
+            settings.LOG_LEVEL,
+            logging.INFO,
+        ),
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
     )
 
-    await init_database()
+
+async def main() -> None:
+    configure_logging()
+
+    logger = logging.getLogger(__name__)
 
     bot = create_bot()
     dispatcher = create_dispatcher()
 
     try:
-        print("Bot is running.")
+        logger.info(
+            "Starting %s",
+            settings.APP_NAME,
+        )
+
+        await init_database()
+
+        logger.info(
+            "Database initialized."
+        )
 
         await bot.delete_webhook(
             drop_pending_updates=settings.DROP_PENDING_UPDATES,
+        )
+
+        logger.info(
+            "Starting Telegram polling..."
         )
 
         await dispatcher.start_polling(
@@ -43,11 +58,20 @@ async def main() -> None:
         )
 
     finally:
+        logger.info(
+            "Shutting down..."
+        )
+
         await bot.session.close()
         await close_database()
 
-        print("Bot stopped.")
+        logger.info(
+            "Application stopped."
+        )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
