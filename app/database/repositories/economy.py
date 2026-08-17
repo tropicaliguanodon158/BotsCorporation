@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Sequence
 
 from sqlalchemy import select
@@ -21,17 +21,18 @@ class EconomyRepository:
     - все изменения кошельков сериализуются одним asyncio.Lock;
     - это особенно важно для SQLite;
     - финансовые операции поддерживают reference_id для
-      защиты от повторного начисления.
+      защиты от повторного выполнения.
 
     Архитектура рассчитана на один постоянно работающий
     процесс бота.
 
     При текущем ограничении:
+
         максимум 5 чатов;
         максимум 50 пользователей в каждом;
         максимум ~250 пользователей.
 
-    Отдельный Redis / distributed lock здесь НЕ нужен.
+    Отдельный Redis / distributed lock здесь не нужен.
     """
 
     _mutation_lock = asyncio.Lock()
@@ -41,59 +42,6 @@ class EconomyRepository:
         session: AsyncSession,
     ) -> None:
         self.session = session
-
-    @staticmethod
-    def _validate_existing_transaction(
-        transaction: Transaction,
-        *,
-        amount: Decimal,
-        transaction_type: str,
-        source: str,
-        related_user_id: int | None,
-    ) -> None:
-        """
-        Проверяет, что повторная операция с тем же
-        reference_id действительно является той же
-        самой бизнес-операцией.
-
-        Это защищает от ситуации:
-
-            reference_id = reward:123
-            первый вызов = 10
-            второй вызов = 1000
-
-        В таком случае нельзя молча вернуть старую
-        транзакцию.
-        """
-
-        expected_amount = amount
-
-        if transaction.amount != expected_amount:
-            raise RuntimeError(
-                "Transaction reference collision: "
-                "amount does not match existing transaction."
-            )
-
-        if transaction.transaction_type != transaction_type:
-            raise RuntimeError(
-                "Transaction reference collision: "
-                "transaction_type does not match."
-            )
-
-        if transaction.source != source:
-            raise RuntimeError(
-                "Transaction reference collision: "
-                "source does not match."
-            )
-
-        if (
-            transaction.related_user_id
-            != related_user_id
-        ):
-            raise RuntimeError(
-                "Transaction reference collision: "
-                "related_user_id does not match."
-            )
 
     # ========================================================================
     # INTERNAL
@@ -107,19 +55,35 @@ class EconomyRepository:
         Привести денежное значение к Decimal с двумя знаками.
         """
 
-        if isinstance(amount, Decimal):
-            result = amount
-        else:
-            result = Decimal(str(amount))
+        try:
+            if isinstance(amount, Decimal):
+                result = amount
+            else:
+                result = Decimal(str(amount))
+        except (
+            InvalidOperation,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                "Amount must be a valid number."
+            ) from exc
 
         if not result.is_finite():
             raise ValueError(
                 "Amount must be a finite number."
             )
 
-        return result.quantize(
-            Decimal("0.01")
-        )
+        try:
+            result = result.quantize(
+                Decimal("0.01")
+            )
+        except InvalidOperation as exc:
+            raise ValueError(
+                "Amount is too large or has invalid precision."
+            ) from exc
+
+        return result
 
     async def _find_reference(
         self,
@@ -128,17 +92,18 @@ class EconomyRepository:
         reference_id: str | None,
     ) -> Transaction | None:
         """
-        Проверить, была ли уже выполнена операция.
+        Найти уже выполненную операцию.
 
-        reference_id должен быть уникальным в рамках
-        конкретного пользователя и бизнес-операции.
+        reference_id уникален в рамках пользователя.
 
-        Важный момент:
-
-        transfer использует один reference_id для двух
-        пользователей, поэтому глобальный UNIQUE constraint
-        на reference_id нам НЕ нужен.
+        Для transfer один и тот же reference_id
+        используется у двух пользователей.
         """
+
+        if reference_id is None:
+            return None
+
+        reference_id = reference_id.strip()
 
         if not reference_id:
             return None
@@ -167,13 +132,30 @@ class EconomyRepository:
         related_user_id: int | None,
     ) -> None:
         """
-        Проверяет повторную финансовую операцию.
+        Проверить, что найденная транзакция действительно
+        соответствует повторяемой бизнес-операции.
 
-        Один reference_id нельзя использовать для
-        другой операции с другими параметрами.
+        Это критично для idempotency.
+
+        Например:
+
+            первый вызов:
+                reference_id = reward:123
+                amount = 100
+
+            второй вызов:
+                reference_id = reward:123
+                amount = 1000
+
+        Второй вызов не должен молча получить
+        транзакцию первого вызова.
         """
 
-        if transaction.amount != expected_amount:
+        existing_amount = Decimal(
+            str(transaction.amount)
+        )
+
+        if existing_amount != expected_amount:
             raise RuntimeError(
                 "Transaction reference collision: "
                 "amount does not match existing transaction."
@@ -182,13 +164,13 @@ class EconomyRepository:
         if transaction.transaction_type != transaction_type:
             raise RuntimeError(
                 "Transaction reference collision: "
-                "transaction_type does not match."
+                "transaction_type does not match existing transaction."
             )
 
         if transaction.source != source:
             raise RuntimeError(
                 "Transaction reference collision: "
-                "source does not match."
+                "source does not match existing transaction."
             )
 
         if (
@@ -197,8 +179,33 @@ class EconomyRepository:
         ):
             raise RuntimeError(
                 "Transaction reference collision: "
-                "related_user_id does not match."
+                "related_user_id does not match existing transaction."
             )
+
+    @staticmethod
+    def _normalize_reference(
+        reference_id: str | None,
+    ) -> str | None:
+        """
+        Нормализовать reference_id.
+
+        Пустая строка считается отсутствующим reference_id.
+        """
+
+        if reference_id is None:
+            return None
+
+        reference_id = reference_id.strip()
+
+        if not reference_id:
+            return None
+
+        if len(reference_id) > 255:
+            raise ValueError(
+                "reference_id cannot be longer than 255 characters."
+            )
+
+        return reference_id
 
     # ========================================================================
     # WALLET
@@ -292,6 +299,17 @@ class EconomyRepository:
         user_id: int,
         amount: Decimal | int | float | str,
     ) -> Wallet:
+        """
+        Прямо установить баланс.
+
+        Использовать только для административных/
+        служебных операций.
+
+        Для обычных финансовых изменений использовать
+        add_balance/remove_balance, чтобы сохранялась
+        история Transaction.
+        """
+
         amount = self.normalize_amount(
             amount
         )
@@ -328,6 +346,21 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
+        """
+        Начислить деньги.
+
+        reference_id обеспечивает idempotency.
+
+        Если reference_id уже существует:
+
+            - возвращается существующая транзакция,
+            - но перед этим проверяется, что она соответствует
+              текущей операции.
+
+        Поэтому один reference_id нельзя использовать
+        для другой финансовой операции.
+        """
+
         amount = self.normalize_amount(
             amount
         )
@@ -347,6 +380,10 @@ class EconomyRepository:
                 "source cannot be empty."
             )
 
+        reference_id = self._normalize_reference(
+            reference_id
+        )
+
         async with self._mutation_lock:
 
             # ----------------------------------------------------------------
@@ -359,6 +396,14 @@ class EconomyRepository:
             )
 
             if existing is not None:
+                self._validate_existing_transaction(
+                    existing,
+                    expected_amount=amount,
+                    transaction_type=transaction_type,
+                    source=source,
+                    related_user_id=related_user_id,
+                )
+
                 return existing
 
             # ----------------------------------------------------------------
@@ -412,6 +457,16 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction | None:
+        """
+        Списать деньги.
+
+        При недостатке средств возвращает None.
+
+        При повторном reference_id возвращает
+        существующую транзакцию после проверки
+        её соответствия текущей операции.
+        """
+
         amount = self.normalize_amount(
             amount
         )
@@ -431,6 +486,10 @@ class EconomyRepository:
                 "source cannot be empty."
             )
 
+        reference_id = self._normalize_reference(
+            reference_id
+        )
+
         async with self._mutation_lock:
 
             # ----------------------------------------------------------------
@@ -443,6 +502,14 @@ class EconomyRepository:
             )
 
             if existing is not None:
+                self._validate_existing_transaction(
+                    existing,
+                    expected_amount=-amount,
+                    transaction_type=transaction_type,
+                    source=source,
+                    related_user_id=related_user_id,
+                )
+
                 return existing
 
             # ----------------------------------------------------------------
@@ -510,6 +577,13 @@ class EconomyRepository:
 
         На SQLite основной механизм защиты —
         _mutation_lock.
+
+        Один reference_id используется одновременно
+        для sender и receiver.
+
+        Повторный вызов возвращает обе существующие
+        транзакции только если ОБЕ операции полностью
+        соответствуют исходной.
         """
 
         amount = self.normalize_amount(
@@ -536,6 +610,10 @@ class EconomyRepository:
                 "source cannot be empty."
             )
 
+        reference_id = self._normalize_reference(
+            reference_id
+        )
+
         async with self._mutation_lock:
 
             # ----------------------------------------------------------------
@@ -556,16 +634,29 @@ class EconomyRepository:
                 sender_existing is not None
                 and receiver_existing is not None
             ):
+                self._validate_existing_transaction(
+                    sender_existing,
+                    expected_amount=-amount,
+                    transaction_type=transaction_type,
+                    source=source,
+                    related_user_id=receiver_id,
+                )
+
+                self._validate_existing_transaction(
+                    receiver_existing,
+                    expected_amount=amount,
+                    transaction_type=transaction_type,
+                    source=source,
+                    related_user_id=sender_id,
+                )
+
                 return (
                     sender_existing,
                     receiver_existing,
                 )
 
             # Если существует только одна сторона,
-            # значит операция находится в неконсистентном состоянии.
-            #
-            # Продолжать нельзя, иначе можно создать
-            # двойное списание/начисление.
+            # операция находится в неконсистентном состоянии.
 
             if (
                 sender_existing is not None
@@ -765,14 +856,15 @@ class EconomyRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> Sequence[Transaction]:
-        if limit < 1:
-            limit = 1
+        limit = max(
+            1,
+            min(limit, 500),
+        )
 
-        if limit > 500:
-            limit = 500
-
-        if offset < 0:
-            offset = 0
+        offset = max(
+            0,
+            offset,
+        )
 
         result = await self.session.execute(
             select(Transaction)
@@ -814,6 +906,16 @@ class EconomyRepository:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
+        """
+        Административное изменение баланса.
+
+        Положительное значение:
+            начисление.
+
+        Отрицательное значение:
+            списание.
+        """
+
         amount = self.normalize_amount(
             amount
         )
@@ -849,3 +951,8 @@ class EconomyRepository:
             )
 
         return transaction
+
+
+__all__ = [
+    "EconomyRepository",
+]

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from aiogram import Dispatcher
 
+from app.config.settings import settings
+
 # ============================================================================
 # COMMON
 # ============================================================================
@@ -88,7 +90,7 @@ def create_dispatcher() -> Dispatcher:
     """
     Создать и полностью настроить Dispatcher.
 
-    Порядок:
+    Порядок обработки:
 
         Telegram update
             ↓
@@ -123,9 +125,17 @@ def create_dispatcher() -> Dispatcher:
         UserMiddleware(),
     )
 
-    dp.message.outer_middleware(
-        AntiFloodMiddleware(),
-    )
+    # ------------------------------------------------------------------------
+    # ANTIFLOOD
+    # ------------------------------------------------------------------------
+
+    if settings.ANTIFLOOD_ENABLED:
+        dp.message.outer_middleware(
+            AntiFloodMiddleware(
+                max_messages=settings.ANTIFLOOD_MESSAGES,
+                interval_seconds=settings.ANTIFLOOD_INTERVAL,
+            )
+        )
 
     # ========================================================================
     # COMMON
@@ -190,3 +200,8 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(founder_moderation_router)
 
     return dp
+
+
+__all__ = [
+    "create_dispatcher",
+]
