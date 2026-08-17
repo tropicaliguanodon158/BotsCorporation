@@ -1,4 +1,3 @@
-```python
 """
 Economy service.
 
@@ -512,4 +511,3 @@ class EconomyService:
         return await self.repository.get_transaction(
             transaction_id
         )
-```
