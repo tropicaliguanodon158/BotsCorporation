@@ -39,27 +39,37 @@ class UserRepository:
         return result.scalar_one_or_none()
 
     async def get_by_id_for_update(
-        self,
-        user_id: int,
-    ) -> User | None:
-        """
-        Получить пользователя с блокировкой строки.
-    
-        Используется для атомарных операций:
-            - cooldown;
-            - награды;
-            - изменение XP;
-            - другие конкурентные операции.
-        """
-    
-        result = await self.session.execute(
-            select(User)
-            .where(User.id == user_id)
-            .with_for_update()
-        )
-    
-        return result.scalar_one_or_none()
+    self,
+    user_id: int,
+) -> User | None:
+    """
+    Получить пользователя для конкурентной операции.
 
+    PostgreSQL:
+        используется SELECT ... FOR UPDATE.
+
+    SQLite:
+        SQLAlchemy корректно сформирует запрос без FOR UPDATE,
+        поэтому фактическая защита от гонок должна обеспечиваться
+        уникальными ограничениями / атомарными операциями на уровне БД.
+
+    Метод оставлен единым для обеих СУБД.
+    """
+
+    query = select(User).where(
+        User.id == user_id,
+    )
+
+    if self.session.bind is not None:
+        dialect_name = self.session.bind.dialect.name
+
+        if dialect_name != "sqlite":
+            query = query.with_for_update()
+
+    result = await self.session.execute(query)
+
+    return result.scalar_one_or_none()
+    
     async def get_many(
         self,
         user_ids: Sequence[int],
