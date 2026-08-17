@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import random
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence
 
 from app.database.models.games import Game, GamePlayer
@@ -11,16 +12,28 @@ from app.database.repositories.games import GamesRepository
 
 class GamesService:
     """
-    Бизнес-логика игровых механик.
+    Бизнес-логика игровой системы.
 
     Важные правила финансовой безопасности:
 
-    1. Ставка и выплата имеют разные reference_id.
-    2. Повторная выплата не должна создавать новые деньги.
-    3. При ошибке после списания ставка возвращается.
-    4. Предварительная проверка баланса не используется как
-       гарантия достаточности средств.
-    5. Реальная проверка баланса выполняется EconomyRepository.
+    1. Каждая ставка получает отдельный reference_id.
+    2. Каждая выплата получает отдельный reference_id.
+    3. Повторная ставка не должна списывать деньги повторно.
+    4. Повторная выплата не должна создавать новые деньги.
+    5. Все изменения выполняются в рамках текущей SQLAlchemy-сессии.
+    6. Commit/rollback выполняет DatabaseMiddleware.
+    7. При ошибке после списания НЕ выполняется ручной refund:
+       транзакция целиком откатывается middleware.
+    8. Внутри одного процесса конкурентные игровые операции
+       сериализуются через asyncio.Lock.
+
+    Важно:
+        asyncio.Lock защищает от race condition внутри одного
+        запущенного процесса бота.
+
+        Для текущей архитектуры проекта (один процесс Python,
+        локальная SQLite/PostgreSQL и ~250 пользователей) этого
+        достаточно.
     """
 
     ACTIVE_STATUSES = {
@@ -36,6 +49,16 @@ class GamesService:
         "duel",
         "coinflip",
     }
+
+    _BET_TYPES = {
+        "dice",
+        "coinflip",
+        "color",
+        "blackjack",
+        "duel",
+    }
+
+    _game_lock = asyncio.Lock()
 
     def __init__(
         self,
@@ -53,9 +76,17 @@ class GamesService:
     def _normalize_amount(
         amount: Decimal | int | float | str,
     ) -> Decimal:
+        """
+        Привести сумму к Decimal(0.01) и проверить её.
+
+        Никогда не используем float напрямую для финансовых операций.
+        Если float всё же пришёл от вызывающего кода, он сначала
+        преобразуется через str().
+        """
+
         try:
             value = Decimal(str(amount))
-        except Exception as exc:
+        except (InvalidOperation, ValueError, TypeError) as exc:
             raise ValueError(
                 "Invalid bet amount."
             ) from exc
@@ -65,9 +96,14 @@ class GamesService:
                 "Bet amount must be finite."
             )
 
-        value = value.quantize(
-            Decimal("0.01")
-        )
+        try:
+            value = value.quantize(
+                Decimal("0.01")
+            )
+        except InvalidOperation as exc:
+            raise ValueError(
+                "Invalid bet amount."
+            ) from exc
 
         if value <= 0:
             raise ValueError(
@@ -77,21 +113,34 @@ class GamesService:
         return value
 
     @staticmethod
+    def _decimal(
+        value: Decimal | int | float | str,
+    ) -> Decimal:
+        """
+        Безопасно преобразовать значение БД/модели в Decimal.
+        """
+
+        try:
+            result = Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                "Invalid decimal value."
+            ) from exc
+
+        if not result.is_finite():
+            raise RuntimeError(
+                "Decimal value must be finite."
+            )
+
+        return result
+
+    @staticmethod
     def _bet_reference(
         round_id: str,
         user_id: int,
     ) -> str:
         return (
             f"{round_id}:bet:{user_id}"
-        )
-
-    @staticmethod
-    def _rollback_reference(
-        round_id: str,
-        user_id: int,
-    ) -> str:
-        return (
-            f"{round_id}:bet_rollback:{user_id}"
         )
 
     @staticmethod
@@ -104,6 +153,28 @@ class GamesService:
             f"{round_id}:payout:"
             f"{game_type}:{user_id}"
         )
+
+    @classmethod
+    def _validate_bet_type(
+        cls,
+        bet_type: str,
+    ) -> str:
+        if not isinstance(
+            bet_type,
+            str,
+        ):
+            raise ValueError(
+                "Bet type must be a string."
+            )
+
+        bet_type = bet_type.strip().lower()
+
+        if bet_type not in cls._BET_TYPES:
+            raise ValueError(
+                f"Unsupported bet type: {bet_type}"
+            )
+
+        return bet_type
 
     # ========================================================================
     # GAME
@@ -128,6 +199,22 @@ class GamesService:
         ),
         game_data: dict[str, Any] | None = None,
     ) -> Game:
+        """
+        Создать игру.
+
+        Проверка active game и создание выполняются
+        под одним process-level lock.
+
+        Это закрывает race condition:
+
+            request A -> get_active_game()
+            request B -> get_active_game()
+            request A -> create_game()
+            request B -> create_game()
+
+        При одном процессе бота второй запрос будет ждать lock.
+        """
+
         game_type = (
             game_type.strip().lower()
         )
@@ -137,6 +224,24 @@ class GamesService:
                 f"Unsupported game type: {game_type}"
             )
 
+        async with self._game_lock:
+            return await self._create_unlocked(
+                game_type=game_type,
+                creator_id=creator_id,
+                chat_id=chat_id,
+                pot=pot,
+                game_data=game_data,
+            )
+
+    async def _create_unlocked(
+        self,
+        *,
+        game_type: str,
+        creator_id: int,
+        chat_id: int | None,
+        pot: Decimal | int | float | str,
+        game_data: dict[str, Any] | None,
+    ) -> Game:
         existing = (
             await self.repository.get_active_game(
                 game_type=game_type,
@@ -155,7 +260,7 @@ class GamesService:
             game_type=game_type,
             creator_id=creator_id,
             chat_id=chat_id,
-            pot=pot,
+            pot=self._decimal(pot),
             game_data=game_data,
         )
 
@@ -163,16 +268,17 @@ class GamesService:
         self,
         game_id: int,
     ) -> Game:
-        game = await self.repository.cancel_game(
-            game_id
-        )
-
-        if game is None:
-            raise ValueError(
-                "Game does not exist."
+        async with self._game_lock:
+            game = await self.repository.cancel_game(
+                game_id
             )
 
-        return game
+            if game is None:
+                raise ValueError(
+                    "Game does not exist."
+                )
+
+            return game
 
     async def join(
         self,
@@ -182,6 +288,20 @@ class GamesService:
         bet: Decimal | int | float | str = Decimal(
             "0.00"
         ),
+    ) -> GamePlayer:
+        async with self._game_lock:
+            return await self._join_unlocked(
+                game_id=game_id,
+                user_id=user_id,
+                bet=bet,
+            )
+
+    async def _join_unlocked(
+        self,
+        *,
+        game_id: int,
+        user_id: int,
+        bet: Decimal | int | float | str,
     ) -> GamePlayer:
         game = await self.repository.get_game(
             game_id
@@ -210,10 +330,19 @@ class GamesService:
         if existing is not None:
             return existing
 
+        normalized_bet = Decimal(
+            "0.00"
+        )
+
+        if self._decimal(bet) > 0:
+            normalized_bet = self._normalize_amount(
+                bet
+            )
+
         return await self.repository.add_player(
             game_id=game_id,
             user_id=user_id,
-            bet=bet,
+            bet=normalized_bet,
         )
 
     async def players(
@@ -228,33 +357,6 @@ class GamesService:
     # ECONOMY
     # ========================================================================
 
-    async def _charge(
-        self,
-        *,
-        user_id: int,
-        amount: Decimal,
-        source: str,
-        reference_id: str,
-    ) -> None:
-        amount = self._normalize_amount(
-            amount
-        )
-
-        transaction = (
-            await self.economy.remove_balance(
-                user_id=user_id,
-                amount=amount,
-                transaction_type="game_bet",
-                source=source,
-                reference_id=reference_id,
-            )
-        )
-
-        if transaction is None:
-            raise ValueError(
-                "Insufficient balance."
-            )
-
     async def _payout(
         self,
         *,
@@ -263,6 +365,15 @@ class GamesService:
         source: str,
         reference_id: str,
     ) -> None:
+        """
+        Начислить выплату.
+
+        EconomyRepository отвечает за идемпотентность
+        reference_id.
+        """
+
+        amount = self._decimal(amount)
+
         if amount <= 0:
             return
 
@@ -272,30 +383,6 @@ class GamesService:
             transaction_type="game_payout",
             source=source,
             reference_id=reference_id,
-        )
-
-    async def _refund_bet(
-        self,
-        *,
-        user_id: int,
-        amount: Decimal,
-        game: Game,
-    ) -> None:
-        """
-        Возврат уже списанной ставки.
-
-        Отдельный reference_id гарантирует, что возврат
-        не будет спутан с исходным списанием.
-        """
-
-        await self._payout(
-            user_id=user_id,
-            amount=amount,
-            source="game_bet_rollback",
-            reference_id=self._rollback_reference(
-                game.round_id,
-                user_id,
-            ),
         )
 
     # ========================================================================
@@ -311,172 +398,167 @@ class GamesService:
         bet_type: str,
         selection: str | None = None,
     ) -> GamePlayer:
-        game = await self.repository.get_game(
-            game_id
-        )
-    
-        if game is None:
-            raise ValueError(
-                "Game does not exist."
-            )
-    
-        if game.status not in self.ACTIVE_STATUSES:
-            raise ValueError(
-                "Game is not active."
-            )
-    
-        amount = self._normalize_amount(
-            amount
-        )
-    
-        # ------------------------------------------------------------------------
-        # IDEMPOTENCY
-        # ------------------------------------------------------------------------
-        #
-        # Если Telegram повторно доставит update или handler будет
-        # вызван повторно, существующая ставка должна быть возвращена,
-        # а не создана заново.
-        #
-        # Это особенно важно, потому что EconomyRepository уже защищает
-        # финансовую транзакцию через reference_id.
-        # ------------------------------------------------------------------------
-    
-        existing_bet = await self.repository.get_user_bet(
-            game_id=game_id,
-            user_id=user_id,
-        )
-    
-        if existing_bet is not None:
-            existing_amount = Decimal(
-                str(existing_bet.amount)
-            )
-    
-            if existing_amount != amount:
-                raise ValueError(
-                    "A different bet already exists for this game."
-                )
-    
-            if existing_bet.bet_type != bet_type:
-                raise ValueError(
-                    "A different bet type already exists for this game."
-                )
-    
-            if existing_bet.selection != selection:
-                raise ValueError(
-                    "A different bet selection already exists for this game."
-                )
-    
-            return existing_bet
-    
-        # ------------------------------------------------------------------------
-        # CHARGE
-        # ------------------------------------------------------------------------
-    
-        reference_id = self._bet_reference(
-            game.round_id,
-            user_id,
-        )
-    
-        transaction = await self.economy.remove_balance(
-            user_id=user_id,
-            amount=amount,
-            transaction_type="game_bet",
-            source=f"game:{game.game_type}:bet",
-            reference_id=reference_id,
-        )
-    
-        if transaction is None:
-            raise ValueError(
-                "Insufficient balance."
-            )
-    
-        # ------------------------------------------------------------------------
-        # PROTECTION AGAINST REFERENCE COLLISION
-        # ------------------------------------------------------------------------
-        #
-        # Если reference_id уже существовал, EconomyRepository вернёт
-        # старую транзакцию. Она должна соответствовать текущей ставке.
-        #
-        # В противном случае нельзя продолжать операцию.
-        # ------------------------------------------------------------------------
-    
-        transaction_amount = Decimal(
-            str(transaction.amount)
-        )
-    
-        if transaction_amount != -amount:
-            raise RuntimeError(
-                "Existing game transaction does not match "
-                "the requested bet amount."
-            )
-    
-        try:
-            bet = await self.repository.create_bet(
+        """
+        Поставить деньги в игре.
+
+        Последовательность:
+
+            1. Проверка игры.
+            2. Проверка существующей ставки.
+            3. Проверка reference_id через EconomyRepository.
+            4. Списание денег.
+            5. Создание GameBet.
+            6. Увеличение pot.
+
+        Всё находится в одной SQLAlchemy transaction.
+
+        Если любой шаг после списания падает,
+        DatabaseMiddleware откатит всю транзакцию.
+        """
+
+        async with self._game_lock:
+            return await self._place_bet_unlocked(
                 game_id=game_id,
                 user_id=user_id,
                 amount=amount,
                 bet_type=bet_type,
                 selection=selection,
             )
-    
-            game.pot += amount
-    
-            updated_game = await self.repository.update_game(
-                game.id,
-                pot=game.pot,
-            )
-    
-            if updated_game is None:
-                raise RuntimeError(
-                    "Game disappeared while placing a bet."
-                )
-    
-            return bet
-    
-        except Exception:
-            # Все изменения находятся в одной SQLAlchemy session.
-            #
-            # DatabaseMiddleware при исключении выполнит rollback,
-            # поэтому здесь НЕ создаём дополнительный возврат денег.
-            #
-            # Иначе получится:
-            #
-            # списание
-            # + возврат
-            # + rollback
-            #
-            # и логика станет крайне легко ломаемой.
-            raise
-    # ========================================================================
-    # VALIDATION
-    # ========================================================================
 
-    @staticmethod
-    def _validate_bet(
-        bet: Decimal | int | float | str,
-    ) -> Decimal:
-        try:
-            amount = Decimal(str(bet))
-        except Exception as exc:
-            raise ValueError(
-                "Invalid bet amount."
-            ) from exc
-
-        if not amount.is_finite():
-            raise ValueError(
-                "Bet amount must be finite."
-            )
-
-        amount = amount.quantize(
-            Decimal("0.01")
+    async def _place_bet_unlocked(
+        self,
+        *,
+        game_id: int,
+        user_id: int,
+        amount: Decimal | int | float | str,
+        bet_type: str,
+        selection: str | None,
+    ) -> GamePlayer:
+        game = await self.repository.get_game(
+            game_id
         )
 
-        if amount <= 0:
+        if game is None:
             raise ValueError(
-                "Bet amount must be greater than zero."
+                "Game does not exist."
             )
 
-        return amount
+        if game.status not in self.ACTIVE_STATUSES:
+            raise ValueError(
+                "Game is not active."
+            )
+
+        amount = self._normalize_amount(
+            amount
+        )
+
+        bet_type = self._validate_bet_type(
+            bet_type
+        )
+
+        # --------------------------------------------------------------------
+        # IDEMPOTENCY
+        # --------------------------------------------------------------------
+
+        existing_bet = (
+            await self.repository.get_user_bet(
+                game_id=game_id,
+                user_id=user_id,
+            )
+        )
+
+        if existing_bet is not None:
+            existing_amount = self._decimal(
+                existing_bet.amount
+            )
+
+            if existing_amount != amount:
+                raise ValueError(
+                    "A different bet already exists "
+                    "for this game."
+                )
+
+            if existing_bet.bet_type != bet_type:
+                raise ValueError(
+                    "A different bet type already exists "
+                    "for this game."
+                )
+
+            if existing_bet.selection != selection:
+                raise ValueError(
+                    "A different bet selection already exists "
+                    "for this game."
+                )
+
+            return existing_bet
+
+        reference_id = self._bet_reference(
+            game.round_id,
+            user_id,
+        )
+
+        # --------------------------------------------------------------------
+        # CHARGE
+        # --------------------------------------------------------------------
+
+        transaction = (
+            await self.economy.remove_balance(
+                user_id=user_id,
+                amount=amount,
+                transaction_type="game_bet",
+                source=f"game:{game.game_type}:bet",
+                reference_id=reference_id,
+            )
+        )
+
+        if transaction is None:
+            raise ValueError(
+                "Insufficient balance."
+            )
+
+        transaction_amount = self._decimal(
+            transaction.amount
+        )
+
+        if transaction_amount != -amount:
+            raise RuntimeError(
+                "Existing game transaction does not match "
+                "the requested bet amount."
+            )
+
+        # --------------------------------------------------------------------
+        # CREATE BET
+        # --------------------------------------------------------------------
+
+        bet = await self.repository.create_bet(
+            game_id=game_id,
+            user_id=user_id,
+            amount=amount,
+            bet_type=bet_type,
+            selection=selection,
+        )
+
+        # --------------------------------------------------------------------
+        # UPDATE POT
+        # --------------------------------------------------------------------
+
+        current_pot = self._decimal(
+            game.pot
+        )
+
+        updated_game = (
+            await self.repository.update_game(
+                game.id,
+                pot=current_pot + amount,
+            )
+        )
+
+        if updated_game is None:
+            raise RuntimeError(
+                "Game disappeared while placing a bet."
+            )
+
+        return bet
 
     # ========================================================================
     # DICE
@@ -505,24 +587,26 @@ class GamesService:
                 "the dice range."
             )
 
-        amount = self._validate_bet(
+        amount = self._normalize_amount(
             bet
         )
 
-        game = await self.create(
-            game_type="dice",
-            creator_id=user_id,
-            chat_id=chat_id,
-        )
+        async with self._game_lock:
+            game = await self._create_unlocked(
+                game_type="dice",
+                creator_id=user_id,
+                chat_id=chat_id,
+                pot=Decimal("0.00"),
+                game_data=None,
+            )
 
-        try:
-            await self.join(
+            await self._join_unlocked(
                 game_id=game.id,
                 user_id=user_id,
                 bet=amount,
             )
 
-            await self.place_bet(
+            await self._place_bet_unlocked(
                 game_id=game.id,
                 user_id=user_id,
                 amount=amount,
@@ -607,9 +691,6 @@ class GamesService:
                 "payout": payout,
             }
 
-        except Exception:
-            raise
-
     # ========================================================================
     # COINFLIP
     # ========================================================================
@@ -645,92 +726,95 @@ class GamesService:
                 "Coin selection must be heads or tails."
             )
 
-        amount = self._validate_bet(
+        amount = self._normalize_amount(
             bet
         )
 
-        game = await self.create(
-            game_type="coinflip",
-            creator_id=user_id,
-            chat_id=chat_id,
-        )
-
-        await self.join(
-            game_id=game.id,
-            user_id=user_id,
-            bet=amount,
-        )
-
-        await self.place_bet(
-            game_id=game.id,
-            user_id=user_id,
-            amount=amount,
-            bet_type="coinflip",
-            selection=selection,
-        )
-
-        await self.repository.start_game(
-            game.id
-        )
-
-        result = random.choice(
-            (
-                "heads",
-                "tails",
+        async with self._game_lock:
+            game = await self._create_unlocked(
+                game_type="coinflip",
+                creator_id=user_id,
+                chat_id=chat_id,
+                pot=Decimal("0.00"),
+                game_data=None,
             )
-        )
 
-        won = result == selection
-
-        payout = (
-            amount * Decimal("1.90")
-            if won
-            else Decimal("0.00")
-        )
-
-        await self.repository.set_player_result(
-            game_id=game.id,
-            user_id=user_id,
-            result=(
-                "winner"
-                if won
-                else "loser"
-            ),
-            payout=payout,
-        )
-
-        if won:
-            await self._payout(
+            await self._join_unlocked(
+                game_id=game.id,
                 user_id=user_id,
-                amount=payout,
-                source="game:coinflip",
-                reference_id=(
-                    self._payout_reference(
-                        game.round_id,
-                        "coinflip",
-                        user_id,
-                    )
+                bet=amount,
+            )
+
+            await self._place_bet_unlocked(
+                game_id=game.id,
+                user_id=user_id,
+                amount=amount,
+                bet_type="coinflip",
+                selection=selection,
+            )
+
+            await self.repository.start_game(
+                game.id
+            )
+
+            result = random.choice(
+                (
+                    "heads",
+                    "tails",
+                )
+            )
+
+            won = result == selection
+
+            payout = (
+                amount * Decimal("1.90")
+                if won
+                else Decimal("0.00")
+            )
+
+            await self.repository.set_player_result(
+                game_id=game.id,
+                user_id=user_id,
+                result=(
+                    "winner"
+                    if won
+                    else "loser"
+                ),
+                payout=payout,
+            )
+
+            if won:
+                await self._payout(
+                    user_id=user_id,
+                    amount=payout,
+                    source="game:coinflip",
+                    reference_id=(
+                        self._payout_reference(
+                            game.round_id,
+                            "coinflip",
+                            user_id,
+                        )
+                    ),
+                )
+
+            await self.repository.finish_game(
+                game.id,
+                winner_id=(
+                    user_id
+                    if won
+                    else None
                 ),
             )
 
-        await self.repository.finish_game(
-            game.id,
-            winner_id=(
-                user_id
-                if won
-                else None
-            ),
-        )
-
-        return {
-            "game_id": game.id,
-            "game_type": "coinflip",
-            "selection": selection,
-            "result": result,
-            "bet": amount,
-            "won": won,
-            "payout": payout,
-        }
+            return {
+                "game_id": game.id,
+                "game_type": "coinflip",
+                "selection": selection,
+                "result": result,
+                "bet": amount,
+                "won": won,
+                "payout": payout,
+            }
 
     # ========================================================================
     # ROULETTE
@@ -770,109 +854,112 @@ class GamesService:
                 "Invalid roulette selection."
             )
 
-        amount = self._validate_bet(
+        amount = self._normalize_amount(
             bet
         )
 
-        game = await self.create(
-            game_type="roulette",
-            creator_id=user_id,
-            chat_id=chat_id,
-        )
+        async with self._game_lock:
+            game = await self._create_unlocked(
+                game_type="roulette",
+                creator_id=user_id,
+                chat_id=chat_id,
+                pot=Decimal("0.00"),
+                game_data=None,
+            )
 
-        await self.join(
-            game_id=game.id,
-            user_id=user_id,
-            bet=amount,
-        )
-
-        await self.place_bet(
-            game_id=game.id,
-            user_id=user_id,
-            amount=amount,
-            bet_type="color",
-            selection=selection,
-        )
-
-        await self.repository.start_game(
-            game.id
-        )
-
-        number = random.randint(
-            0,
-            36,
-        )
-
-        if number == 0:
-            color = "green"
-        elif number in {
-            1, 3, 5, 7, 9,
-            12, 14, 16, 18,
-            19, 21, 23, 25,
-            27, 30, 32, 34, 36,
-        }:
-            color = "red"
-        else:
-            color = "black"
-
-        won = color == selection
-
-        multiplier = (
-            Decimal("14.00")
-            if selection == "green"
-            else Decimal("1.90")
-        )
-
-        payout = (
-            amount * multiplier
-            if won
-            else Decimal("0.00")
-        )
-
-        await self.repository.set_player_result(
-            game_id=game.id,
-            user_id=user_id,
-            result=(
-                "winner"
-                if won
-                else "loser"
-            ),
-            payout=payout,
-        )
-
-        if won:
-            await self._payout(
+            await self._join_unlocked(
+                game_id=game.id,
                 user_id=user_id,
-                amount=payout,
-                source="game:roulette",
-                reference_id=(
-                    self._payout_reference(
-                        game.round_id,
-                        "roulette",
-                        user_id,
-                    )
+                bet=amount,
+            )
+
+            await self._place_bet_unlocked(
+                game_id=game.id,
+                user_id=user_id,
+                amount=amount,
+                bet_type="color",
+                selection=selection,
+            )
+
+            await self.repository.start_game(
+                game.id
+            )
+
+            number = random.randint(
+                0,
+                36,
+            )
+
+            if number == 0:
+                color = "green"
+            elif number in {
+                1, 3, 5, 7, 9,
+                12, 14, 16, 18,
+                19, 21, 23, 25,
+                27, 30, 32, 34, 36,
+            }:
+                color = "red"
+            else:
+                color = "black"
+
+            won = color == selection
+
+            multiplier = (
+                Decimal("14.00")
+                if selection == "green"
+                else Decimal("1.90")
+            )
+
+            payout = (
+                amount * multiplier
+                if won
+                else Decimal("0.00")
+            )
+
+            await self.repository.set_player_result(
+                game_id=game.id,
+                user_id=user_id,
+                result=(
+                    "winner"
+                    if won
+                    else "loser"
+                ),
+                payout=payout,
+            )
+
+            if won:
+                await self._payout(
+                    user_id=user_id,
+                    amount=payout,
+                    source="game:roulette",
+                    reference_id=(
+                        self._payout_reference(
+                            game.round_id,
+                            "roulette",
+                            user_id,
+                        )
+                    ),
+                )
+
+            await self.repository.finish_game(
+                game.id,
+                winner_id=(
+                    user_id
+                    if won
+                    else None
                 ),
             )
 
-        await self.repository.finish_game(
-            game.id,
-            winner_id=(
-                user_id
-                if won
-                else None
-            ),
-        )
-
-        return {
-            "game_id": game.id,
-            "game_type": "roulette",
-            "number": number,
-            "color": color,
-            "selection": selection,
-            "bet": amount,
-            "won": won,
-            "payout": payout,
-        }
+            return {
+                "game_id": game.id,
+                "game_type": "roulette",
+                "number": number,
+                "color": color,
+                "selection": selection,
+                "bet": amount,
+                "won": won,
+                "payout": payout,
+            }
 
     # ========================================================================
     # BLACKJACK
@@ -885,177 +972,178 @@ class GamesService:
         chat_id: int | None,
         bet: Decimal | int | float | str,
     ) -> dict[str, Any]:
-        amount = self._validate_bet(
+        amount = self._normalize_amount(
             bet
         )
 
-        game = await self.create(
-            game_type="blackjack",
-            creator_id=user_id,
-            chat_id=chat_id,
-        )
-
-        await self.join(
-            game_id=game.id,
-            user_id=user_id,
-            bet=amount,
-        )
-
-        await self.place_bet(
-            game_id=game.id,
-            user_id=user_id,
-            amount=amount,
-            bet_type="blackjack",
-        )
-
-        await self.repository.start_game(
-            game.id
-        )
-
-        def draw_card() -> int:
-            card = random.randint(
-                1,
-                13,
-            )
-            return min(
-                card,
-                10,
+        async with self._game_lock:
+            game = await self._create_unlocked(
+                game_type="blackjack",
+                creator_id=user_id,
+                chat_id=chat_id,
+                pot=Decimal("0.00"),
+                game_data=None,
             )
 
-        def hand_value(
-            cards: list[int],
-        ) -> int:
-            value = sum(cards)
-            aces = cards.count(1)
-
-            while (
-                aces
-                and value + 10 <= 21
-            ):
-                value += 10
-                aces -= 1
-
-            return value
-
-        player_cards = [
-            draw_card(),
-            draw_card(),
-        ]
-
-        dealer_cards = [
-            draw_card(),
-            draw_card(),
-        ]
-
-        player_value = hand_value(
-            player_cards
-        )
-
-        dealer_value = hand_value(
-            dealer_cards
-        )
-
-        while player_value < 17:
-            player_cards.append(
-                draw_card()
+            await self._join_unlocked(
+                game_id=game.id,
+                user_id=user_id,
+                bet=amount,
             )
+
+            await self._place_bet_unlocked(
+                game_id=game.id,
+                user_id=user_id,
+                amount=amount,
+                bet_type="blackjack",
+            )
+
+            await self.repository.start_game(
+                game.id
+            )
+
+            def draw_card() -> int:
+                card = random.randint(
+                    1,
+                    13,
+                )
+                return min(
+                    card,
+                    10,
+                )
+
+            def hand_value(
+                cards: list[int],
+            ) -> int:
+                value = sum(cards)
+                aces = cards.count(1)
+
+                while (
+                    aces
+                    and value + 10 <= 21
+                ):
+                    value += 10
+                    aces -= 1
+
+                return value
+
+            player_cards = [
+                draw_card(),
+                draw_card(),
+            ]
+
+            dealer_cards = [
+                draw_card(),
+                draw_card(),
+            ]
+
             player_value = hand_value(
                 player_cards
             )
 
-        while dealer_value < 17:
-            dealer_cards.append(
-                draw_card()
-            )
             dealer_value = hand_value(
                 dealer_cards
             )
 
-        player_blackjack = (
-            len(player_cards) == 2
-            and player_value == 21
-        )
+            while player_value < 17:
+                player_cards.append(
+                    draw_card()
+                )
+                player_value = hand_value(
+                    player_cards
+                )
 
-        dealer_blackjack = (
-            len(dealer_cards) == 2
-            and dealer_value == 21
-        )
+            while dealer_value < 17:
+                dealer_cards.append(
+                    draw_card()
+                )
+                dealer_value = hand_value(
+                    dealer_cards
+                )
 
-        if (
-            player_blackjack
-            and not dealer_blackjack
-        ):
-            result = "blackjack"
-            multiplier = Decimal("2.50")
+            player_blackjack = (
+                len(player_cards) == 2
+                and player_value == 21
+            )
 
-        elif player_value > 21:
-            result = "loser"
-            multiplier = Decimal("0.00")
+            dealer_blackjack = (
+                len(dealer_cards) == 2
+                and dealer_value == 21
+            )
 
-        elif dealer_value > 21:
-            result = "winner"
-            multiplier = Decimal("1.90")
+            if (
+                player_blackjack
+                and not dealer_blackjack
+            ):
+                result = "blackjack"
+                multiplier = Decimal("2.50")
 
-        elif player_value > dealer_value:
-            result = "winner"
-            multiplier = Decimal("1.90")
+            elif player_value > 21:
+                result = "loser"
+                multiplier = Decimal("0.00")
 
-        elif player_value < dealer_value:
-            result = "loser"
-            multiplier = Decimal("0.00")
+            elif dealer_value > 21:
+                result = "winner"
+                multiplier = Decimal("1.90")
 
-        else:
-            result = "draw"
-            multiplier = Decimal("1.00")
+            elif player_value > dealer_value:
+                result = "winner"
+                multiplier = Decimal("1.90")
 
-        payout = (
-            amount * multiplier
-        )
+            elif player_value < dealer_value:
+                result = "loser"
+                multiplier = Decimal("0.00")
 
-        await self.repository.set_player_result(
-            game_id=game.id,
-            user_id=user_id,
-            result=result,
-            payout=payout,
-        )
+            else:
+                result = "draw"
+                multiplier = Decimal("1.00")
 
-        if payout > 0:
-            await self._payout(
+            payout = amount * multiplier
+
+            await self.repository.set_player_result(
+                game_id=game.id,
                 user_id=user_id,
-                amount=payout,
-                source="game:blackjack",
-                reference_id=(
-                    self._payout_reference(
-                        game.round_id,
+                result=result,
+                payout=payout,
+            )
+
+            if payout > 0:
+                await self._payout(
+                    user_id=user_id,
+                    amount=payout,
+                    source="game:blackjack",
+                    reference_id=(
+                        self._payout_reference(
+                            game.round_id,
+                            "blackjack",
+                            user_id,
+                        )
+                    ),
+                )
+
+            await self.repository.finish_game(
+                game.id,
+                winner_id=(
+                    user_id
+                    if result in {
+                        "winner",
                         "blackjack",
-                        user_id,
-                    )
+                    }
+                    else None
                 ),
             )
 
-        await self.repository.finish_game(
-            game.id,
-            winner_id=(
-                user_id
-                if result in {
-                    "winner",
-                    "blackjack",
-                }
-                else None
-            ),
-        )
-
-        return {
-            "game_id": game.id,
-            "game_type": "blackjack",
-            "player_cards": player_cards,
-            "dealer_cards": dealer_cards,
-            "player_value": player_value,
-            "dealer_value": dealer_value,
-            "result": result,
-            "bet": amount,
-            "payout": payout,
-        }
+            return {
+                "game_id": game.id,
+                "game_type": "blackjack",
+                "player_cards": player_cards,
+                "dealer_cards": dealer_cards,
+                "player_value": player_value,
+                "dealer_value": dealer_value,
+                "result": result,
+                "bet": amount,
+                "payout": payout,
+            }
 
     # ========================================================================
     # DUEL
@@ -1074,49 +1162,57 @@ class GamesService:
                 "You cannot duel yourself."
             )
 
-        amount = self._validate_bet(
+        amount = self._normalize_amount(
             bet
         )
 
-        game = await self.create(
-            game_type="duel",
-            creator_id=creator_id,
-            chat_id=chat_id,
-        )
+        async with self._game_lock:
+            game = await self._create_unlocked(
+                game_type="duel",
+                creator_id=creator_id,
+                chat_id=chat_id,
+                pot=Decimal("0.00"),
+                game_data=None,
+            )
 
-        creator_charged = False
-        opponent_charged = False
+            # ----------------------------------------------------------------
+            # BOTH PLAYERS ARE PART OF THE SAME TRANSACTION
+            # ----------------------------------------------------------------
+            #
+            # Если списание второго игрока не удалось,
+            # исключение поднимается наверх.
+            #
+            # DatabaseMiddleware выполнит rollback,
+            # поэтому списание первого игрока тоже исчезнет.
+            #
+            # Никакого ручного refund здесь НЕ делаем.
+            # ----------------------------------------------------------------
 
-        try:
-            await self.join(
+            await self._join_unlocked(
                 game_id=game.id,
                 user_id=creator_id,
                 bet=amount,
             )
 
-            await self.place_bet(
+            await self._place_bet_unlocked(
                 game_id=game.id,
                 user_id=creator_id,
                 amount=amount,
                 bet_type="duel",
             )
 
-            creator_charged = True
-
-            await self.join(
+            await self._join_unlocked(
                 game_id=game.id,
                 user_id=opponent_id,
                 bet=amount,
             )
 
-            await self.place_bet(
+            await self._place_bet_unlocked(
                 game_id=game.id,
                 user_id=opponent_id,
                 amount=amount,
                 bet_type="duel",
             )
-
-            opponent_charged = True
 
             await self.repository.start_game(
                 game.id
@@ -1182,24 +1278,3 @@ class GamesService:
                 "bet": amount,
                 "winner_payout": winner_payout,
             }
-
-        except Exception:
-
-            # Если place_bet() уже создал собственный rollback,
-            # повторно деньги здесь не возвращаем.
-
-            # Если первая ставка была успешно списана,
-            # но ошибка произошла до второй ставки,
-            # возвращаем первую.
-
-            if (
-                creator_charged
-                and not opponent_charged
-            ):
-                await self._refund_bet(
-                    user_id=creator_id,
-                    amount=amount,
-                    game=game,
-                )
-
-            raise
