@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 from aiogram import Router
@@ -15,6 +16,14 @@ router = Router(
 )
 
 
+def create_rewards_service(session) -> RewardsService:
+    return RewardsService(
+        economy_repository=EconomyRepository(session),
+        settings_repository=SettingsRepository(session),
+        user_repository=UserRepository(session),
+    )
+
+
 # ============================================================================
 # HOURLY
 # ============================================================================
@@ -25,41 +34,28 @@ async def hourly_handler(
     message: Message,
     session,
 ) -> None:
-    """
-    Выдать часовую награду.
-
-    Проверка cooldown будет добавлена
-    отдельным этапом.
-    """
-
     if message.from_user is None:
         return
 
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    economy_repository = EconomyRepository(
-        session,
-    )
-
-    settings_repository = SettingsRepository(
-        session,
-    )
-
-    user_repository = UserRepository(
-        session,
-    )
-
-    service = RewardsService(
-        economy_repository=economy_repository,
-        settings_repository=settings_repository,
-        user_repository=user_repository,
-    )
+    service = create_rewards_service(session)
 
     result = await service.hourly_reward(
-        user_id=user_id,
-        chat_id=chat_id,
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
     )
+
+    if not result.rewarded:
+        if result.reason == "cooldown":
+            await message.answer(
+                "⏰ Часовую награду можно получать "
+                "не чаще одного раза в час."
+            )
+            return
+
+        await message.answer(
+            "❌ Часовая награда сейчас недоступна."
+        )
+        return
 
     await message.answer(
         "⏰ <b>Часовая награда</b>\n\n"
@@ -79,41 +75,28 @@ async def daily_handler(
     message: Message,
     session,
 ) -> None:
-    """
-    Выдать ежедневную награду.
-
-    Защита от повторного получения будет
-    подключена отдельным этапом.
-    """
-
     if message.from_user is None:
         return
 
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    economy_repository = EconomyRepository(
-        session,
-    )
-
-    settings_repository = SettingsRepository(
-        session,
-    )
-
-    user_repository = UserRepository(
-        session,
-    )
-
-    service = RewardsService(
-        economy_repository=economy_repository,
-        settings_repository=settings_repository,
-        user_repository=user_repository,
-    )
+    service = create_rewards_service(session)
 
     result = await service.daily_reward(
-        user_id=user_id,
-        chat_id=chat_id,
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
     )
+
+    if not result.rewarded:
+        if result.reason == "already_claimed":
+            await message.answer(
+                "🎁 Ежедневная награда уже получена сегодня.\n"
+                "Возвращайся завтра."
+            )
+            return
+
+        await message.answer(
+            "❌ Ежедневная награда сейчас недоступна."
+        )
+        return
 
     await message.answer(
         "🎁 <b>Ежедневная награда</b>\n\n"
@@ -121,3 +104,4 @@ async def daily_handler(
         f"⭐ +{result.xp} XP\n"
         f"💎 +{result.gems}"
     )
+```
