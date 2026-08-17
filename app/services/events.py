@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime
 
 from app.database.repositories.tasks import TasksRepository
@@ -11,10 +12,23 @@ class EventsService:
     Центральная обработка игровых и пользовательских событий.
 
     Важно:
+
         commit()/rollback() выполняет DatabaseMiddleware.
 
     Сервис не обращается к Telegram API.
+
+    Для message-событий используется process-local lock.
+
+    Это необходимо потому, что бот работает одним процессом,
+    а несколько Telegram updates могут обрабатываться конкурентно.
+    Без lock операции вида:
+
+        user.message_count += 1
+
+    могли бы потерять инкремент.
     """
+
+    _message_lock = asyncio.Lock()
 
     def __init__(
         self,
@@ -71,77 +85,82 @@ class EventsService:
         xp: int = 0,
     ):
         """
-        Обрабатывает обычное сообщение.
+        Обработать обычное сообщение.
 
         Изменяет:
+
             - общий счётчик сообщений;
             - дневной счётчик;
             - дневную активность;
             - XP.
 
-        Возвращает уже обновлённого пользователя.
+        Несколько конкурентных message updates
+        сериализуются одним asyncio.Lock.
 
-        Все изменения находятся в одной SQLAlchemy session.
+        Это рассчитано на архитектуру проекта:
+
+            один процесс бота
+            SQLite
+            ~250 пользователей
         """
 
-        user = await self.user_repository.get_by_id(
-            user_id,
-        )
+        async with self._message_lock:
 
-        if user is None:
-            raise ValueError(
-                "User does not exist."
+            user = await self.user_repository.get_by_id(
+                user_id,
             )
 
-        if not user.is_active:
+            if user is None:
+                raise ValueError(
+                    "User does not exist."
+                )
+
+            if not user.is_active:
+                return user
+
+            message_type = (
+                message_type.strip().lower()
+            )
+
+            if message_type not in {
+                "text",
+                "photo",
+                "video",
+                "other",
+            }:
+                message_type = "other"
+
+            # ================================================================
+            # MESSAGE COUNTERS
+            # ================================================================
+
+            user.message_count += 1
+            user.daily_message_count += 1
+
+            # ================================================================
+            # DAILY ACTIVITY
+            # ================================================================
+
+            if self.tasks_repository is not None:
+                await self.tasks_repository.increment_daily_activity(
+                    user_id=user_id,
+                    activity_date=(
+                        activity_date
+                        or datetime.now().date()
+                    ),
+                    message_type=message_type,
+                )
+
+            # ================================================================
+            # XP
+            # ================================================================
+
+            if xp > 0:
+                user.xp += xp
+
+            await self.user_repository.session.flush()
+
             return user
-
-        message_type = (
-            message_type.strip().lower()
-        )
-
-        if message_type not in {
-            "text",
-            "photo",
-            "video",
-            "other",
-        }:
-            message_type = "other"
-
-        # ====================================================================
-        # MESSAGE COUNTERS
-        # ====================================================================
-
-        user.message_count += 1
-        user.daily_message_count += 1
-
-        # ====================================================================
-        # DAILY ACTIVITY
-        # ====================================================================
-
-        if self.tasks_repository is not None:
-            await self.tasks_repository.increment_daily_activity(
-                user_id=user_id,
-                activity_date=(
-                    activity_date
-                    or datetime.now().date()
-                ),
-                message_type=message_type,
-            )
-
-        # ====================================================================
-        # XP
-        # ====================================================================
-
-        if xp > 0:
-            user.xp += xp
-
-        # Изменения уже находятся в session.
-        # Отдельные UPDATE + повторный SELECT здесь не нужны.
-
-        await self.user_repository.session.flush()
-
-        return user
 
     # ========================================================================
     # XP

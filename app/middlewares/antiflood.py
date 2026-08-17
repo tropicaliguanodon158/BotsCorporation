@@ -11,30 +11,19 @@ from aiogram.types import Message, TelegramObject
 
 class AntiFloodMiddleware(BaseMiddleware):
     """
-    Тихий антифлуд.
+    Тихий технический антифлуд.
 
-    Middleware отслеживает частоту сообщений пользователей
-    отдельно для каждого чата.
+    Работает в рамках одного процесса бота.
 
-    Важные принципы:
+    Правила:
 
-    1. Никаких сообщений от бота при обнаружении флуда.
-    2. Не блокируем пользователя Telegram автоматически.
-    3. Просто прекращаем дальнейшую обработку слишком частых
-       сообщений.
-    4. Для каждого пользователя и чата используется отдельная
-       история сообщений.
-    5. Старые записи автоматически удаляются из памяти.
-
-    Это middleware отвечает именно за технический антифлуд.
-
-    Реальная модерация:
-        mute
-        warn
-        ban
-        delete
-
-    будет находиться в moderation service.
+    - действует только в групповых/супергрупповых чатах;
+    - личные сообщения не ограничиваются;
+    - бот ничего не отправляет при обнаружении флуда;
+    - Telegram ban/mute здесь не выполняется;
+    - сообщение, попавшее под flood-limit, полностью прекращает
+      дальнейшую обработку update;
+    - состояние хранится только в памяти процесса.
     """
 
     def __init__(
@@ -43,18 +32,6 @@ class AntiFloodMiddleware(BaseMiddleware):
         interval_seconds: float = 3.0,
         cleanup_interval_seconds: float = 60.0,
     ) -> None:
-        """
-        Args:
-            max_messages:
-                Максимальное количество сообщений.
-
-            interval_seconds:
-                За какой промежуток времени считаются сообщения.
-
-            cleanup_interval_seconds:
-                Как часто очищать устаревшие записи.
-        """
-
         if max_messages <= 0:
             raise ValueError(
                 "max_messages должен быть больше 0."
@@ -72,24 +49,7 @@ class AntiFloodMiddleware(BaseMiddleware):
 
         self.max_messages = max_messages
         self.interval_seconds = interval_seconds
-        self.cleanup_interval_seconds = (
-            cleanup_interval_seconds
-        )
-
-        # ------------------------------------------------------------------
-        # Message history
-        # ------------------------------------------------------------------
-        #
-        # Структура:
-        #
-        # {
-        #     chat_id: {
-        #         user_id: deque([timestamp, timestamp, ...])
-        #     }
-        # }
-        #
-        # deque выбран специально, потому что нам нужно быстро
-        # удалять самые старые записи.
+        self.cleanup_interval_seconds = cleanup_interval_seconds
 
         self._messages: dict[
             int,
@@ -97,8 +57,6 @@ class AntiFloodMiddleware(BaseMiddleware):
         ] = defaultdict(
             lambda: defaultdict(deque)
         )
-
-        # Последний момент очистки памяти.
 
         self._last_cleanup = time.monotonic()
 
@@ -112,25 +70,18 @@ class AntiFloodMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         """
-        Проверяет сообщение на флуд.
+        Проверить update на флуд.
 
-        Если пользователь не превысил лимит —
-        передаём событие дальше.
+        Если update не является Message — пропускаем.
 
-        Если превысил —
-        молча прекращаем обработку.
+        Если это личное сообщение — пропускаем.
+
+        Если пользователь превысил лимит —
+        полностью прекращаем дальнейшую обработку.
         """
-
-        # --------------------------------------------------------------
-        # Проверяем, является ли событие сообщением
-        # --------------------------------------------------------------
 
         if not isinstance(event, Message):
             return await handler(event, data)
-
-        # --------------------------------------------------------------
-        # Получаем необходимые данные
-        # --------------------------------------------------------------
 
         if event.from_user is None:
             return await handler(event, data)
@@ -138,26 +89,16 @@ class AntiFloodMiddleware(BaseMiddleware):
         if event.chat is None:
             return await handler(event, data)
 
-        user_id = event.from_user.id
-        chat_id = event.chat.id
-
-        # --------------------------------------------------------------
-        # Пропускаем личные сообщения
-        # --------------------------------------------------------------
-        #
-        # Антифлуд нужен прежде всего для групп.
-        #
-        # В ЛС основателю и пользователям он нам мешать не должен.
-
+        # Личные сообщения не ограничиваем.
         if event.chat.type == "private":
             return await handler(event, data)
 
-        # --------------------------------------------------------------
-        # Очистка старых данных
-        # --------------------------------------------------------------
+        user_id = event.from_user.id
+        chat_id = event.chat.id
 
         now = time.monotonic()
 
+        # Периодическая очистка общей структуры.
         if (
             now - self._last_cleanup
             >= self.cleanup_interval_seconds
@@ -165,53 +106,42 @@ class AntiFloodMiddleware(BaseMiddleware):
             self._cleanup(now)
             self._last_cleanup = now
 
-        # --------------------------------------------------------------
-        # Получаем историю пользователя
-        # --------------------------------------------------------------
-
         user_messages = self._messages[chat_id][user_id]
-
-        # --------------------------------------------------------------
-        # Удаляем сообщения, вышедшие за временное окно
-        # --------------------------------------------------------------
 
         cutoff = now - self.interval_seconds
 
-        while user_messages and user_messages[0] <= cutoff:
+        # Удаляем timestamps, вышедшие из окна.
+        while (
+            user_messages
+            and user_messages[0] <= cutoff
+        ):
             user_messages.popleft()
 
-        # --------------------------------------------------------------
-        # Проверяем лимит
-        # --------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # FLOOD
+        # ---------------------------------------------------------------------
 
         if len(user_messages) >= self.max_messages:
-            # Сообщение считается флудом.
+            # Ничего не отправляем пользователю.
             #
-            # Ничего пользователю не отправляем.
-            # Никаких исключений.
+            # Главное:
+            # handler НЕ вызывается.
             #
-            # Просто не передаём событие дальше.
-
+            # Поскольку middleware установлен на update.outer_middleware,
+            # UserMiddleware также не будет вызван.
             return None
 
-        # --------------------------------------------------------------
-        # Регистрируем сообщение
-        # --------------------------------------------------------------
-
+        # Сообщение прошло проверку.
         user_messages.append(now)
-
-        # --------------------------------------------------------------
-        # Передаём управление следующему middleware / handler
-        # --------------------------------------------------------------
 
         return await handler(event, data)
 
-    def _cleanup(self, now: float) -> None:
+    def _cleanup(
+        self,
+        now: float,
+    ) -> None:
         """
-        Удаляет устаревшие записи из памяти.
-
-        Это необходимо, чтобы словари не росли бесконечно
-        при большом количестве пользователей и чатов.
+        Удалить устаревшие timestamps и пустые структуры.
         """
 
         cutoff = now - self.interval_seconds
@@ -223,15 +153,16 @@ class AntiFloodMiddleware(BaseMiddleware):
         for chat_id, users in self._messages.items():
             for user_id, timestamps in users.items():
 
-                while timestamps and timestamps[0] <= cutoff:
+                while (
+                    timestamps
+                    and timestamps[0] <= cutoff
+                ):
                     timestamps.popleft()
 
                 if not timestamps:
                     empty_users.append(
                         (chat_id, user_id)
                     )
-
-        # Удаляем пустые записи пользователей.
 
         for chat_id, user_id in empty_users:
             users = self._messages.get(chat_id)
@@ -241,8 +172,6 @@ class AntiFloodMiddleware(BaseMiddleware):
 
             users.pop(user_id, None)
 
-        # Удаляем пустые чаты.
-
         empty_chats = [
             chat_id
             for chat_id, users in self._messages.items()
@@ -250,7 +179,10 @@ class AntiFloodMiddleware(BaseMiddleware):
         ]
 
         for chat_id in empty_chats:
-            self._messages.pop(chat_id, None)
+            self._messages.pop(
+                chat_id,
+                None,
+            )
 
     def reset_user(
         self,
@@ -258,10 +190,7 @@ class AntiFloodMiddleware(BaseMiddleware):
         user_id: int,
     ) -> None:
         """
-        Сбрасывает антифлуд для конкретного пользователя.
-
-        Может пригодиться после ручного вмешательства
-        администратора.
+        Сбросить flood-history конкретного пользователя.
         """
 
         users = self._messages.get(chat_id)
@@ -269,24 +198,33 @@ class AntiFloodMiddleware(BaseMiddleware):
         if users is None:
             return
 
-        users.pop(user_id, None)
+        users.pop(
+            user_id,
+            None,
+        )
 
         if not users:
-            self._messages.pop(chat_id, None)
+            self._messages.pop(
+                chat_id,
+                None,
+            )
 
     def reset_chat(
         self,
         chat_id: int,
     ) -> None:
         """
-        Полностью сбрасывает антифлуд конкретного чата.
+        Сбросить flood-history конкретного чата.
         """
 
-        self._messages.pop(chat_id, None)
+        self._messages.pop(
+            chat_id,
+            None,
+        )
 
     def reset_all(self) -> None:
         """
-        Полностью очищает состояние антифлуда.
+        Полностью очистить состояние антифлуда.
         """
 
         self._messages.clear()

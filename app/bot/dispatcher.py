@@ -53,6 +53,7 @@ from app.handlers.founder.users import router as founder_users_router
 # ============================================================================
 
 from app.handlers.games.blackjack import router as blackjack_router
+from app.handlers.games.coinflip import router as coinflip_router
 from app.handlers.games.dice import router as dice_router
 from app.handlers.games.duel import router as duel_router
 from app.handlers.games.roulette import router as roulette_router
@@ -90,11 +91,13 @@ def create_dispatcher() -> Dispatcher:
     """
     Создать и полностью настроить Dispatcher.
 
-    Порядок обработки:
+    Порядок обработки update:
 
         Telegram update
             ↓
         LoggingMiddleware
+            ↓
+        AntiFloodMiddleware
             ↓
         DatabaseMiddleware
             ↓
@@ -105,88 +108,105 @@ def create_dispatcher() -> Dispatcher:
         Handler
             ↓
         commit / rollback
+
+    AntiFlood намеренно находится на уровне update.
+
+    Это важно для экономики:
+    сообщение, которое является флудом, не должно доходить
+    до UserMiddleware и EventsService, иначе пользователь сможет
+    получать награды/счётчики за сообщения, которые антифлуд
+    фактически должен был отбросить.
     """
 
     dp = Dispatcher()
 
-    # ========================================================================
+    # =========================================================================
     # MIDDLEWARE
-    # ========================================================================
+    # =========================================================================
 
     dp.update.outer_middleware(
         LoggingMiddleware(),
     )
 
-    dp.update.outer_middleware(
-        DatabaseMiddleware(),
-    )
-
-    dp.update.outer_middleware(
-        UserMiddleware(),
-    )
-
-    # ------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # ANTIFLOOD
-    # ------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     if settings.ANTIFLOOD_ENABLED:
-        dp.message.outer_middleware(
+        dp.update.outer_middleware(
             AntiFloodMiddleware(
                 max_messages=settings.ANTIFLOOD_MESSAGES,
                 interval_seconds=settings.ANTIFLOOD_INTERVAL,
             )
         )
 
-    # ========================================================================
+    # -------------------------------------------------------------------------
+    # DATABASE
+    # -------------------------------------------------------------------------
+
+    dp.update.outer_middleware(
+        DatabaseMiddleware(),
+    )
+
+    # -------------------------------------------------------------------------
+    # USER
+    # -------------------------------------------------------------------------
+
+    dp.update.outer_middleware(
+        UserMiddleware(),
+    )
+
+    # =========================================================================
     # COMMON
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(start_router)
     dp.include_router(help_router)
     dp.include_router(profile_router)
 
-    # ========================================================================
+    # =========================================================================
     # CHARACTER
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(character_router)
     dp.include_router(character_inventory_router)
     dp.include_router(abilities_router)
 
-    # ========================================================================
+    # =========================================================================
     # ECONOMY
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(balance_router)
     dp.include_router(bank_router)
     dp.include_router(rewards_router)
     dp.include_router(shop_router)
 
-    # ========================================================================
+    # =========================================================================
     # GAMES
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(dice_router)
     dp.include_router(roulette_router)
     dp.include_router(duel_router)
     dp.include_router(blackjack_router)
+    dp.include_router(coinflip_router)
 
-    # ========================================================================
+    # =========================================================================
     # INTERACTIONS
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(interactions_router)
 
-    # ========================================================================
+    # =========================================================================
     # MODERATION
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(moderation_router)
     dp.include_router(moderation_filters_router)
 
-    # ========================================================================
+    # =========================================================================
     # FOUNDER PANEL
-    # ========================================================================
+    # =========================================================================
 
     dp.include_router(founder_panel_router)
     dp.include_router(founder_users_router)
