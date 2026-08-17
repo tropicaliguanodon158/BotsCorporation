@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 from typing import Sequence
@@ -39,37 +40,39 @@ class UserRepository:
         return result.scalar_one_or_none()
 
     async def get_by_id_for_update(
-    self,
-    user_id: int,
-) -> User | None:
-    """
-    Получить пользователя для конкурентной операции.
+        self,
+        user_id: int,
+    ) -> User | None:
+        """
+        Получить пользователя для конкурентной операции.
 
-    PostgreSQL:
-        используется SELECT ... FOR UPDATE.
+        PostgreSQL:
+            используется SELECT ... FOR UPDATE.
 
-    SQLite:
-        SQLAlchemy корректно сформирует запрос без FOR UPDATE,
-        поэтому фактическая защита от гонок должна обеспечиваться
-        уникальными ограничениями / атомарными операциями на уровне БД.
+        SQLite:
+            SELECT ... FOR UPDATE не поддерживается,
+            поэтому защита конкурентных операций должна
+            дополнительно обеспечиваться атомарными
+            операциями и ограничениями БД.
 
-    Метод оставлен единым для обеих СУБД.
-    """
+        Метод оставлен единым для обеих СУБД.
+        """
 
-    query = select(User).where(
-        User.id == user_id,
-    )
+        query = select(User).where(
+            User.id == user_id,
+        )
 
-    if self.session.bind is not None:
-        dialect_name = self.session.bind.dialect.name
+        bind = self.session.get_bind()
 
-        if dialect_name != "sqlite":
+        if bind.dialect.name != "sqlite":
             query = query.with_for_update()
 
-    result = await self.session.execute(query)
+        result = await self.session.execute(
+            query
+        )
 
-    return result.scalar_one_or_none()
-    
+        return result.scalar_one_or_none()
+
     async def get_many(
         self,
         user_ids: Sequence[int],
@@ -83,7 +86,9 @@ class UserRepository:
             )
         )
 
-        return list(result.scalars().all())
+        return list(
+            result.scalars().all()
+        )
 
     async def exists(
         self,
@@ -95,7 +100,10 @@ class UserRepository:
             )
         )
 
-        return result.scalar_one_or_none() is not None
+        return (
+            result.scalar_one_or_none()
+            is not None
+        )
 
     # ========================================================================
     # CREATE
@@ -109,7 +117,9 @@ class UserRepository:
         username: str | None = None,
     ) -> User:
         if user_id <= 0:
-            raise ValueError("Invalid Telegram user_id.")
+            raise ValueError(
+                "Invalid Telegram user_id."
+            )
 
         if not first_name:
             raise ValueError(
@@ -143,11 +153,14 @@ class UserRepository:
         """
         Получает пользователя или создаёт его.
 
-        В рамках одного update/session обычной проверки достаточно.
-        Уникальный PK users.id дополнительно защищает БД от дубля.
+        users.id является PRIMARY KEY и дополнительно
+        защищает от существования двух одинаковых
+        Telegram пользователей.
         """
 
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is not None:
             return user, False
@@ -173,21 +186,21 @@ class UserRepository:
         username: str | None,
     ) -> User | None:
         """
-        Полностью синхронизирует Telegram-профиль.
-
-        В отличие от старой реализации None здесь означает
-        реальное значение Telegram-профиля, а не «не менять».
+        Полностью синхронизирует профиль
+        с актуальными данными Telegram.
         """
-
-        user = await self.get_by_id(user_id)
-
-        if user is None:
-            return None
 
         if not first_name:
             raise ValueError(
                 "Telegram first_name cannot be empty."
             )
+
+        user = await self.get_by_id(
+            user_id
+        )
+
+        if user is None:
+            return None
 
         user.first_name = first_name
         user.last_name = last_name
@@ -204,8 +217,12 @@ class UserRepository:
     ) -> bool:
         result = await self.session.execute(
             update(User)
-            .where(User.id == user_id)
-            .values(is_active=is_active)
+            .where(
+                User.id == user_id
+            )
+            .values(
+                is_active=is_active
+            )
         )
 
         return result.rowcount > 0
@@ -220,9 +237,13 @@ class UserRepository:
         amount: int,
     ) -> User | None:
         if amount == 0:
-            return await self.get_by_id(user_id)
+            return await self.get_by_id(
+                user_id
+            )
 
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -238,7 +259,9 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -258,7 +281,9 @@ class UserRepository:
         user_id: int,
         level: int,
     ) -> User | None:
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -278,7 +303,9 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -294,7 +321,9 @@ class UserRepository:
         user_id: int,
         amount: int,
     ) -> User | None:
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -315,9 +344,13 @@ class UserRepository:
         amount: int = 1,
     ) -> User | None:
         if amount <= 0:
-            return await self.get_by_id(user_id)
+            return await self.get_by_id(
+                user_id
+            )
 
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -334,9 +367,13 @@ class UserRepository:
         amount: int = 1,
     ) -> User | None:
         if amount <= 0:
-            return await self.get_by_id(user_id)
+            return await self.get_by_id(
+                user_id
+            )
 
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -351,7 +388,9 @@ class UserRepository:
         self,
         user_id: int,
     ) -> User | None:
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(
+            user_id
+        )
 
         if user is None:
             return None
@@ -374,3 +413,4 @@ class UserRepository:
             user_id,
             False,
         )
+```
