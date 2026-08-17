@@ -1,29 +1,13 @@
+```python
 """
 Economy service.
 
 Содержит бизнес-логику экономики проекта.
 
-Отвечает за:
-    - баланс пользователей;
-    - переводы;
-    - начисления;
-    - списания;
-    - гемы;
-    - административные корректировки;
-    - историю транзакций.
+Service не работает с SQLAlchemy напрямую.
+Все операции с БД выполняются через EconomyRepository.
 
-ВАЖНО:
-
-Service НЕ работает с SQLAlchemy напрямую.
-
-Он использует:
-    EconomyRepository
-
-Repository отвечает за БД.
-Service отвечает за бизнес-правила.
-
-commit() / rollback() выполняются выше уровня сервиса
-через общую транзакцию приложения.
+commit / rollback выполняются уровнем выше.
 """
 
 from __future__ import annotations
@@ -31,58 +15,71 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Sequence
 
-from app.database.repositories.economy import EconomyRepository
 from app.database.models.economy import Transaction, Wallet
+from app.database.repositories.economy import EconomyRepository
 
 
 class EconomyService:
-    """
-    Сервис экономики пользователя.
-    """
+    """Бизнес-логика экономики пользователя."""
 
-    def __init__(
-        self,
-        repository: EconomyRepository,
-    ) -> None:
+    def __init__(self, repository: EconomyRepository) -> None:
         self.repository = repository
 
     # ========================================================================
-    # INTERNAL HELPERS
+    # INTERNAL
     # ========================================================================
 
     @staticmethod
     def normalize_amount(
         amount: Decimal | int | float | str,
     ) -> Decimal:
-        """
-        Нормализовать денежное значение.
+        """Нормализовать денежную сумму до двух знаков."""
 
-        Все денежные операции в сервисе работают
-        с двумя знаками после запятой.
-        """
+        return EconomyRepository.normalize_amount(amount)
 
-        return EconomyRepository.normalize_amount(
-            amount
-        )
-
-    @staticmethod
+    @classmethod
     def validate_positive_amount(
+        cls,
         amount: Decimal | int | float | str,
     ) -> Decimal:
-        """
-        Проверить, что сумма положительная.
-        """
+        """Проверить положительную денежную сумму."""
 
-        amount = EconomyService.normalize_amount(
-            amount
-        )
+        normalized = cls.normalize_amount(amount)
 
-        if amount <= 0:
+        if normalized <= 0:
             raise ValueError(
                 "Amount must be greater than zero."
             )
 
-        return amount
+        return normalized
+
+    @staticmethod
+    def validate_user_id(user_id: int) -> None:
+        if user_id <= 0:
+            raise ValueError("Invalid user_id.")
+
+    @staticmethod
+    def validate_source(source: str) -> str:
+        if not source or not source.strip():
+            raise ValueError(
+                "Transaction source cannot be empty."
+            )
+
+        return source.strip()
+
+    @staticmethod
+    def validate_transaction_type(
+        transaction_type: str,
+    ) -> str:
+        if (
+            not transaction_type
+            or not transaction_type.strip()
+        ):
+            raise ValueError(
+                "Transaction type cannot be empty."
+            )
+
+        return transaction_type.strip()
 
     # ========================================================================
     # WALLET
@@ -92,16 +89,9 @@ class EconomyService:
         self,
         user_id: int,
     ) -> Wallet:
-        """
-        Получить кошелёк пользователя.
+        """Получить или создать кошелёк."""
 
-        Если кошелька нет — он создаётся.
-        """
-
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
         return await self.repository.get_or_create_wallet(
             user_id
@@ -111,14 +101,9 @@ class EconomyService:
         self,
         user_id: int,
     ) -> Decimal:
-        """
-        Получить баланс пользователя.
-        """
+        """Получить баланс пользователя."""
 
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
         return await self.repository.get_balance(
             user_id
@@ -128,14 +113,9 @@ class EconomyService:
         self,
         user_id: int,
     ) -> int:
-        """
-        Получить количество гемов пользователя.
-        """
+        """Получить количество гемов."""
 
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
         return await self.repository.get_gems(
             user_id
@@ -144,6 +124,42 @@ class EconomyService:
     # ========================================================================
     # ADD BALANCE
     # ========================================================================
+
+    async def add_balance(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal | int | float | str,
+        transaction_type: str = "income",
+        source: str = "system",
+        related_user_id: int | None = None,
+        reference_id: str | None = None,
+        metadata_json: str | None = None,
+    ) -> Transaction:
+        """
+        Начислить деньги.
+
+        Это основной низкоуровневый метод для положительной
+        финансовой операции.
+        """
+
+        self.validate_user_id(user_id)
+
+        amount = self.validate_positive_amount(amount)
+        source = self.validate_source(source)
+        transaction_type = self.validate_transaction_type(
+            transaction_type
+        )
+
+        return await self.repository.add_balance(
+            user_id=user_id,
+            amount=amount,
+            transaction_type=transaction_type,
+            source=source,
+            related_user_id=related_user_id,
+            reference_id=reference_id,
+            metadata_json=metadata_json,
+        )
 
     async def add_money(
         self,
@@ -156,45 +172,13 @@ class EconomyService:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction:
-        """
-        Начислить пользователю деньги.
+        """Алиас add_balance для более читаемого API."""
 
-        Это основной метод для любых доходов.
-
-        Например:
-
-            сообщение
-            награда
-            выигрыш
-            продажа предмета
-            ежедневная награда
-            часовая награда
-        """
-
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
-
-        amount = self.validate_positive_amount(
-            amount
-        )
-
-        if not source or not source.strip():
-            raise ValueError(
-                "Transaction source cannot be empty."
-            )
-
-        if not transaction_type or not transaction_type.strip():
-            raise ValueError(
-                "Transaction type cannot be empty."
-            )
-
-        return await self.repository.add_balance(
+        return await self.add_balance(
             user_id=user_id,
             amount=amount,
-            transaction_type=transaction_type.strip(),
-            source=source.strip(),
+            transaction_type=transaction_type,
+            source=source,
             related_user_id=related_user_id,
             reference_id=reference_id,
             metadata_json=metadata_json,
@@ -203,6 +187,41 @@ class EconomyService:
     # ========================================================================
     # REMOVE BALANCE
     # ========================================================================
+
+    async def remove_balance(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal | int | float | str,
+        transaction_type: str = "expense",
+        source: str = "system",
+        related_user_id: int | None = None,
+        reference_id: str | None = None,
+        metadata_json: str | None = None,
+    ) -> Transaction | None:
+        """
+        Списать деньги.
+
+        None означает недостаточный баланс.
+        """
+
+        self.validate_user_id(user_id)
+
+        amount = self.validate_positive_amount(amount)
+        source = self.validate_source(source)
+        transaction_type = self.validate_transaction_type(
+            transaction_type
+        )
+
+        return await self.repository.remove_balance(
+            user_id=user_id,
+            amount=amount,
+            transaction_type=transaction_type,
+            source=source,
+            related_user_id=related_user_id,
+            reference_id=reference_id,
+            metadata_json=metadata_json,
+        )
 
     async def remove_money(
         self,
@@ -215,45 +234,20 @@ class EconomyService:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> Transaction | None:
-        """
-        Списать деньги у пользователя.
+        """Алиас remove_balance."""
 
-        Возвращает:
-            Transaction — если успешно;
-            None — если недостаточно средств.
-        """
-
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
-
-        amount = self.validate_positive_amount(
-            amount
-        )
-
-        if not source or not source.strip():
-            raise ValueError(
-                "Transaction source cannot be empty."
-            )
-
-        if not transaction_type or not transaction_type.strip():
-            raise ValueError(
-                "Transaction type cannot be empty."
-            )
-
-        return await self.repository.remove_balance(
+        return await self.remove_balance(
             user_id=user_id,
             amount=amount,
-            transaction_type=transaction_type.strip(),
-            source=source.strip(),
+            transaction_type=transaction_type,
+            source=source,
             related_user_id=related_user_id,
             reference_id=reference_id,
             metadata_json=metadata_json,
         )
 
     # ========================================================================
-    # CHECK BALANCE
+    # BALANCE CHECK
     # ========================================================================
 
     async def has_money(
@@ -262,17 +256,13 @@ class EconomyService:
         user_id: int,
         amount: Decimal | int | float | str,
     ) -> bool:
-        """
-        Проверить наличие необходимой суммы.
-        """
+        """Проверить наличие необходимой суммы."""
 
-        amount = self.validate_positive_amount(
-            amount
-        )
+        self.validate_user_id(user_id)
 
-        balance = await self.get_balance(
-            user_id
-        )
+        amount = self.validate_positive_amount(amount)
+
+        balance = await self.get_balance(user_id)
 
         return balance >= amount
 
@@ -290,45 +280,18 @@ class EconomyService:
         reference_id: str | None = None,
         metadata_json: str | None = None,
     ) -> tuple[Transaction, Transaction]:
-        """
-        Перевести деньги между пользователями.
+        """Перевести деньги между пользователями."""
 
-        Возвращает:
-
-            (
-                транзакция отправителя,
-                транзакция получателя,
-            )
-
-        При недостатке средств выбрасывается ValueError.
-
-        Почему здесь, а не в handler:
-
-        Handler должен только получить Telegram-команду
-        и передать данные сервису.
-
-        Правило "нельзя перевести больше своего баланса"
-        является бизнес-логикой и находится здесь.
-        """
-
-        if sender_id <= 0:
-            raise ValueError(
-                "Invalid sender_id."
-            )
-
-        if receiver_id <= 0:
-            raise ValueError(
-                "Invalid receiver_id."
-            )
+        self.validate_user_id(sender_id)
+        self.validate_user_id(receiver_id)
 
         if sender_id == receiver_id:
             raise ValueError(
                 "Cannot transfer money to yourself."
             )
 
-        amount = self.validate_positive_amount(
-            amount
-        )
+        amount = self.validate_positive_amount(amount)
+        source = self.validate_source(source)
 
         result = await self.repository.transfer(
             sender_id=sender_id,
@@ -348,6 +311,65 @@ class EconomyService:
         return result
 
     # ========================================================================
+    # REWARDS
+    # ========================================================================
+
+    async def reward(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal | int | float | str,
+        source: str,
+        reference_id: str | None = None,
+        metadata_json: str | None = None,
+    ) -> Transaction:
+        """Начислить пользователю награду."""
+
+        return await self.add_balance(
+            user_id=user_id,
+            amount=amount,
+            transaction_type="reward",
+            source=source,
+            reference_id=reference_id,
+            metadata_json=metadata_json,
+        )
+
+    # ========================================================================
+    # CHARGE
+    # ========================================================================
+
+    async def charge(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal | int | float | str,
+        source: str,
+        reference_id: str | None = None,
+        metadata_json: str | None = None,
+    ) -> Transaction:
+        """
+        Списать деньги за действие.
+
+        При недостатке средств выбрасывается ValueError.
+        """
+
+        transaction = await self.remove_balance(
+            user_id=user_id,
+            amount=amount,
+            transaction_type="expense",
+            source=source,
+            reference_id=reference_id,
+            metadata_json=metadata_json,
+        )
+
+        if transaction is None:
+            raise ValueError(
+                "Insufficient balance."
+            )
+
+        return transaction
+
+    # ========================================================================
     # GEMS
     # ========================================================================
 
@@ -358,28 +380,16 @@ class EconomyService:
         amount: int,
         source: str = "system",
     ) -> Wallet:
-        """
-        Начислить гемы.
+        """Начислить гемы."""
 
-        source пока является параметром сервиса,
-        чтобы позже можно было добавить отдельный
-        журнал операций с гемами.
-        """
-
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
         if amount <= 0:
             raise ValueError(
                 "Gem amount must be greater than zero."
             )
 
-        if not source or not source.strip():
-            raise ValueError(
-                "Gem source cannot be empty."
-            )
+        self.validate_source(source)
 
         return await self.repository.add_gems(
             user_id=user_id,
@@ -392,16 +402,9 @@ class EconomyService:
         user_id: int,
         amount: int,
     ) -> bool:
-        """
-        Списать гемы.
+        """Списать гемы."""
 
-        False означает недостаток гемов.
-        """
-
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
         if amount <= 0:
             raise ValueError(
@@ -419,108 +422,18 @@ class EconomyService:
         user_id: int,
         amount: int,
     ) -> bool:
-        """
-        Проверить наличие гемов.
-        """
+        """Проверить наличие гемов."""
+
+        self.validate_user_id(user_id)
 
         if amount <= 0:
             raise ValueError(
                 "Gem amount must be greater than zero."
             )
 
-        gems = await self.get_gems(
-            user_id
-        )
+        gems = await self.get_gems(user_id)
 
         return gems >= amount
-
-    # ========================================================================
-    # REWARDS
-    # ========================================================================
-
-    async def reward(
-        self,
-        *,
-        user_id: int,
-        amount: Decimal | int | float | str,
-        source: str,
-        reference_id: str | None = None,
-        metadata_json: str | None = None,
-    ) -> Transaction:
-        """
-        Универсальное начисление награды.
-
-        Это удобная точка входа для других сервисов.
-
-        Например:
-
-            EconomyService.reward(
-                user_id=user_id,
-                amount=5,
-                source="message",
-            )
-
-        Или:
-
-            source="hourly_reward"
-            source="daily_reward"
-            source="case_reward"
-            source="game_win"
-        """
-
-        return await self.add_money(
-            user_id=user_id,
-            amount=amount,
-            source=source,
-            transaction_type="reward",
-            reference_id=reference_id,
-            metadata_json=metadata_json,
-        )
-
-    # ========================================================================
-    # PURCHASE
-    # ========================================================================
-
-    async def charge(
-        self,
-        *,
-        user_id: int,
-        amount: Decimal | int | float | str,
-        source: str,
-        reference_id: str | None = None,
-        metadata_json: str | None = None,
-    ) -> Transaction:
-        """
-        Списать деньги за действие.
-
-        Используется магазинами, играми и командами.
-
-        Например:
-
-            charge(
-                user_id=user_id,
-                amount=100,
-                source="duel",
-            )
-
-        При недостатке средств выбрасывается ValueError.
-        """
-
-        transaction = await self.remove_money(
-            user_id=user_id,
-            amount=amount,
-            source=source,
-            transaction_type="expense",
-            reference_id=reference_id,
-            metadata_json=metadata_json,
-        )
-
-        if transaction is None:
-            raise ValueError(
-                "Insufficient balance."
-            )
-
-        return transaction
 
     # ========================================================================
     # ADMIN
@@ -535,26 +448,18 @@ class EconomyService:
         metadata_json: str | None = None,
     ) -> Transaction:
         """
-        Административно изменить баланс.
+        Административная корректировка баланса.
 
         amount > 0:
             начисление.
 
         amount < 0:
             списание.
-
-        amount == 0:
-            запрещено.
         """
 
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
-        amount = self.normalize_amount(
-            amount
-        )
+        amount = self.normalize_amount(amount)
 
         if amount == 0:
             raise ValueError(
@@ -570,7 +475,7 @@ class EconomyService:
         )
 
     # ========================================================================
-    # TRANSACTION HISTORY
+    # TRANSACTIONS
     # ========================================================================
 
     async def get_transactions(
@@ -580,14 +485,9 @@ class EconomyService:
         limit: int = 50,
         offset: int = 0,
     ) -> Sequence[Transaction]:
-        """
-        Получить историю финансовых операций.
-        """
+        """Получить историю операций."""
 
-        if user_id <= 0:
-            raise ValueError(
-                "Invalid user_id."
-            )
+        self.validate_user_id(user_id)
 
         limit = max(1, min(limit, 500))
         offset = max(0, offset)
@@ -602,9 +502,7 @@ class EconomyService:
         self,
         transaction_id: int,
     ) -> Transaction | None:
-        """
-        Получить конкретную транзакцию.
-        """
+        """Получить конкретную транзакцию."""
 
         if transaction_id <= 0:
             raise ValueError(
@@ -614,3 +512,4 @@ class EconomyService:
         return await self.repository.get_transaction(
             transaction_id
         )
+```
